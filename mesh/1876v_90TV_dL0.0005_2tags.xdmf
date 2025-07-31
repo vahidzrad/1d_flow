@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<!DOCTYPE Xdmf SYSTEM "Xdmf.dtd" []>
+<Xdmf Version="3.0" xmlns:xi="http://www.w3.org/2001/XInclude">
+  <Domain>
+    <Grid Name="mesh" GridType="Uniform">
+      <Topology TopologyType="PolyLine" NumberOfElements="2040006" NodesPerElement="2">
+        <DataItem Dimensions="2040006 2" NumberType="Int" Format="HDF">1876v_90TV_dL0.0005_2tags.h5:/Mesh/mesh/topology</DataItem>
+      </Topology>
+      <Geometry GeometryType="XYZ">
+        <DataItem Dimensions="2039531 3" Format="HDF">1876v_90TV_dL0.0005_2tags.h5:/Mesh/mesh/geometry</DataItem>
+      </Geometry>
+    </Grid>
+    <Grid Name="Cell tags" GridType="Uniform">
+      <xi:include xpointer="xpointer(/Xdmf/Domain/Grid/Geometry)" />
+      <Topology TopologyType="PolyLine" NumberOfElements="2040006" NodesPerElement="2">
+        <DataItem Dimensions="2040006 2" NumberType="Int" Format="HDF">1876v_90TV_dL0.0005_2tags.h5:/MeshTags/Cell tags/topology</DataItem>
+      </Topology>
+      <Attribute Name="Cell tags" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="2040006 1" Format="HDF">1876v_90TV_dL0.0005_2tags.h5:/MeshTags/Cell tags/Values</DataItem>
+      </Attribute>
+    </Grid>
+    <Grid Name="mesh_tags" GridType="Uniform">
+      <xi:include xpointer="xpointer(/Xdmf/Domain/Grid/Geometry)" />
+      <Topology TopologyType="PolyVertex" NumberOfElements="2" NodesPerElement="1">
+        <DataItem Dimensions="2 1" NumberType="Int" Format="HDF">1876v_90TV_dL0.0005_2tags.h5:/MeshTags/mesh_tags/topology</DataItem>
+      </Topology>
+      <Attribute Name="mesh_tags" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="2 1" Format="HDF">1876v_90TV_dL0.0005_2tags.h5:/MeshTags/mesh_tags/Values</DataItem>
+      </Attribute>
+    </Grid>
+  </Domain>
+</Xdmf>
