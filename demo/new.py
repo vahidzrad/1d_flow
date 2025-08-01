@@ -54,10 +54,13 @@ P1 = FiniteElement("CG", mesh.ufl_cell(), 1)
 V  = FunctionSpace(mesh, MixedElement([P1, P1]))
 V0, V1 = V.sub(0).collapse(), V.sub(1).collapse()
 
+# Mixed unknown function
+U_mixed = Function(V)
+
 ψ  = TestFunction(V)
 δ  = TrialFunction(V)
 ϕ, ϕt = split(ψ)            # test functions (blood, tissue)
-U,  Ut = split(Function(V))  # unknowns  (blood, tissue)
+U,  Ut = U_mixed.split()    # unknowns  (blood, tissue)
 
 # Ensure non-negative arguments in nonlinear terms
 U_safe  = conditional(gt(U,  0.0), U,  0.0)
@@ -140,7 +143,7 @@ C50 = Constant(2.5 * mmHg_to_mmGs)
 # -----------------------------------------------------------------------------
 U_init  = assign_initial_condition_vertex_based(mesh, V0, 100*pO2C)
 Ut_init = interpolate(Constant(50*pO2C), V1)
-FunctionAssigner(V, [V0, V1]).assign(U, [U_init, Ut_init])
+FunctionAssigner(V, [V0, V1]).assign(U_mixed, [U_init, Ut_init])
 
 # -----------------------------------------------------------------------------
 #  BOUNDARY CONDITIONS
@@ -182,7 +185,7 @@ maxG_val      = 70e-12 * Ghypertrophy        # [mol mm⁻³ s⁻¹]
 num_steps     = 10
 pseudo_dt     = Constant(1e2)
 
-_, Ut_old = U.split(deepcopy=True)
+_, Ut_old = U_mixed.split(deepcopy=True)
 
 for step in range(num_steps):
     print(f"\n=== pseudo-time {step+1}/{num_steps} ===")
@@ -215,9 +218,9 @@ for step in range(num_steps):
           )*dx
 
     F  = Fb + Ft
-    J  = derivative(F, U, δ)
+    J  = derivative(F, U_mixed, δ)
 
-    problem = NonlinearVariationalProblem(F, U, bcs, J)
+    problem = NonlinearVariationalProblem(F, U_mixed, bcs, J)
     solver  = NonlinearVariationalSolver(problem)
     prm = solver.parameters["snes_solver"]
     prm.update({"report": True,
@@ -228,17 +231,17 @@ for step in range(num_steps):
     solver.solve()
 
     # Update pseudo-time variable
-    _, Ut_new = U.split(deepcopy=True)
+    _, Ut_new = U_mixed.split(deepcopy=True)
     Ut_old.assign(Ut_new)
 
     # Write results
     sid = step+1
     with XDMFFile(commMPI, f"./results_1876v/CFb_step_{sid:02d}.xdmf") as xb:
-        Ublood, _ = U.split()
+        Ublood, _ = U_mixed.split()
         Ublood.rename("CFb", "")
         xb.write(Ublood)
     with XDMFFile(commMPI, f"./results_1876v/CFt_step_{sid:02d}.xdmf") as xt:
-        _, Utissue = U.split()
+        _, Utissue = U_mixed.split()
         Utissue.rename("CFt", "")
         xt.write(Utissue)
 
