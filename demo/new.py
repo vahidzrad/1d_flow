@@ -1,23 +1,11 @@
-"""Simplified pseudo-time stepping solver for the 1D flow model.
-
-This script mirrors the original implementation but wraps the most
-important set-up steps in small helper functions.  The aim is easier
-maintenance and clearer separation of mesh loading, data preparation
-and the actual solver loop.
-
-The hard coded ``base_dir`` from the original version is preserved as
-requested.  Only the surrounding logic is refactored.
-"""
-
 from dolfin import *
 import numpy as np
 import scipy.io as sio
-import os
-import sys
+import os, sys
 from time import time
 from ufl import tanh, dot, grad, inner, variable
 from mpi4py import MPI
-import argparse
+
 
 base_dir = "/mnt/home/ziaeirad/1d_flow/"
 sys.path.append(base_dir)
@@ -67,10 +55,14 @@ P1 = FiniteElement("CG", mesh.ufl_cell(), 1)
 V  = FunctionSpace(mesh, MixedElement([P1, P1]))
 V0, V1 = V.sub(0).collapse(), V.sub(1).collapse()
 
+
+# Mixed unknown function
+U_mixed = Function(V)
+
 ψ  = TestFunction(V)
 δ  = TrialFunction(V)
 ϕ, ϕt = split(ψ)            # test functions (blood, tissue)
-U,  Ut = split(Function(V))  # unknowns  (blood, tissue)
+U,  Ut = U_mixed.split()    # unknowns  (blood, tissue)
 
 # Ensure non-negative arguments in nonlinear terms
 U_safe  = conditional(gt(U,  0.0), U,  0.0)
@@ -153,7 +145,8 @@ C50 = Constant(2.5 * mmHg_to_mmGs)
 # -----------------------------------------------------------------------------
 U_init  = assign_initial_condition_vertex_based(mesh, V0, 100*pO2C)
 Ut_init = interpolate(Constant(50*pO2C), V1)
-FunctionAssigner(V, [V0, V1]).assign(U, [U_init, Ut_init])
+
+FunctionAssigner(V, [V0, V1]).assign(U_mixed, [U_init, Ut_init])
 
 # -----------------------------------------------------------------------------
 #  BOUNDARY CONDITIONS
@@ -192,90 +185,68 @@ def funR(CFn, CTn, CFtn):
 #  PSEUDO-TIME LOOP
 # -----------------------------------------------------------------------------
 
-def pseudo_time_loop(num_steps=10, pseudo_dt=Constant(1e2)):
-    """Run the non-linear pseudo-time iterations."""
-    start_time = time()
-    _, Ut_old = U.split(deepcopy=True)
+maxG_val      = 70e-12 * Ghypertrophy        # [mol mm⁻³ s⁻¹]
+num_steps     = 10
+pseudo_dt     = Constant(1e2)
 
-    for step in range(num_steps):
-        print(f"\n=== pseudo-time {step+1}/{num_steps} ===")
+_, Ut_old = U_mixed.split(deepcopy=True)
 
-        # Ramp metabolism
-        maxG = assign_local_property_vertexBased(
-            mesh, maxG_val * (step + 1) / num_steps, V0
-        )
+for step in range(num_steps):
+    print(f"\n=== pseudo-time {step+1}/{num_steps} ===")
 
-        # Derived fields
-        CB = variable(4 * CHb * Hct * SHb(mesh, U_safe, pO2C))
-        CT = CB + U_safe
-        consumption = maxG * Ut_safe / (Ut_safe + km + 1e-24)
+    # Ramp metabolism
+    maxG = assign_local_property_vertexBased(mesh,
+                                             maxG_val*(step+1)/num_steps,
+                                             V0)
 
-        # Blood residual (incl. SUPG)
-        Fb = (
-            0.5 * weakL(ϕ, U_safe, CT)
-            + 0.5 * weakL(ϕ, U_safe, CT)
-            - (0.5 * AkVb * Ut * ϕ + 0.5 * AkVb * Ut * ϕ) * dx
-        )
+    # Derived fields
+    CB = variable(4*CHb*Hct*SHb(mesh, U_safe, pO2C))
+    CT = CB + U_safe
+    consumption = maxG * Ut_safe / (Ut_safe + km + 1e-24)
 
-        if steadySUPG:
-            Pe = advU * dL / (2 * (Db + Db / 65))
-            tau = (dL / (2 * advU)) * (1 / tanh(Pe) - 1 / Pe) * W_inv
-            Fb += inner(tau * Pw, funR(U, CT, Ut)) * dx
+    # Blood residual (incl. SUPG)
+    Fb = 0.5*weakL(ϕ, U_safe, CT) + 0.5*weakL(ϕ, U_safe, CT) \
+         - (0.5*AkVb*Ut*ϕ + 0.5*AkVb*Ut*ϕ)*dx
 
-        # Tissue residual – **sign fixed** (+AkVt)
-        Ft = (
-            (Ut - Ut_old) / pseudo_dt * ϕt
-            + AkVt * (U - Ut) * ϕt
-            + consumption * ϕt
-            + Dt * inner(grad(Ut), grad(ϕt))
-            + Dmb * CMb * inner(grad(Ut / (Ut + C50)), grad(ϕt))
-        ) * dx
+    if steadySUPG:
+        Pe = advU*dL / (2*(Db + Db/65))
+        tau = (dL/(2*advU))*(1/tanh(Pe) - 1/Pe) * W_inv
+        Fb += inner(tau*Pw, funR(U, CT, Ut))*dx   # inner-product fix
 
-        F = Fb + Ft
-        J = derivative(F, U, δ)
+    # Tissue residual – **sign fixed** (+AkVt)
+    Ft = ((Ut - Ut_old)/pseudo_dt * ϕt
+          + AkVt*(U - Ut)*ϕt                     # ← sign corrected
+          + consumption*ϕt
+          + Dt*inner(grad(Ut), grad(ϕt))
+          + Dmb*CMb*inner(grad(Ut/(Ut + C50)), grad(ϕt))
+          )*dx
 
-        problem = NonlinearVariationalProblem(F, U, bcs, J)
-        solver = NonlinearVariationalSolver(problem)
-        prm = solver.parameters["snes_solver"]
-        prm.update(
-            {
-                "report": True,
+    F  = Fb + Ft
+    J  = derivative(F, U_mixed, δ)
+
+    problem = NonlinearVariationalProblem(F, U_mixed, bcs, J)
+    solver  = NonlinearVariationalSolver(problem)
+    prm = solver.parameters["snes_solver"]
+    prm.update({"report": True,
                 "absolute_tolerance": 1e-13,
                 "maximum_iterations": 1000,
-                "linear_solver": "lu",
-            }
-        )
+                "linear_solver": "lu"})
 
-        solver.solve()
+    solver.solve()
 
-        # Update pseudo-time variable
-        _, Ut_new = U.split(deepcopy=True)
-        Ut_old.assign(Ut_new)
+    # Update pseudo-time variable
+    _, Ut_new = U_mixed.split(deepcopy=True)
+    Ut_old.assign(Ut_new)
 
-        # Write results
-        sid = step + 1
-        with XDMFFile(commMPI, f"./results_1876v/CFb_step_{sid:02d}.xdmf") as xb:
-            Ublood, _ = U.split()
-            Ublood.rename("CFb", "")
-            xb.write(Ublood)
-        with XDMFFile(commMPI, f"./results_1876v/CFt_step_{sid:02d}.xdmf") as xt:
-            _, Utissue = U.split()
-            Utissue.rename("CFt", "")
-            xt.write(Utissue)
+    # Write results
+    sid = step+1
+    with XDMFFile(commMPI, f"./results_1876v/CFb_step_{sid:02d}.xdmf") as xb:
+        Ublood, _ = U_mixed.split()
+        Ublood.rename("CFb", "")
+        xb.write(Ublood)
+    with XDMFFile(commMPI, f"./results_1876v/CFt_step_{sid:02d}.xdmf") as xt:
+        _, Utissue = U_mixed.split()
+        Utissue.rename("CFt", "")
+        xt.write(Utissue)
 
-    print(f"Total runtime: {time() - start_time:.1f} s")
-
-
-maxG_val = 70e-12 * Ghypertrophy  # [mol mm⁻³ s⁻¹]
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run pseudo-time solver")
-    parser.add_argument(
-        "--steps",
-        type=int,
-        default=10,
-        help="number of pseudo-time steps"
-    )
-    args = parser.parse_args()
-    pseudo_time_loop(num_steps=args.steps)
+print(f"Total runtime: {time() - start_time:.1f} s")

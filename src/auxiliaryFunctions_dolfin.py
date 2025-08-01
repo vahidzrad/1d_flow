@@ -11,10 +11,16 @@ Author: Haifeng Wang  ·  Cleanup: ChatGPT (July-2025)
 
 import os
 import shutil
+
+import sys
 import math
+import tempfile
+import zipfile
+from typing import List, Sequence, Tuple
 
 import numpy as np
 from mpi4py import MPI
+from petsc4py import PETSc
 
 # -----------------------------------------------------------------------------
 # Legacy FEniCS imports
@@ -22,9 +28,14 @@ from mpi4py import MPI
 from dolfin import (
     Mesh, MeshFunction, FunctionSpace, VectorFunctionSpace, Function,
     TrialFunction, TestFunction, UserExpression, project,
-    assemble_system, dx, inner, Constant,
-    cells, PETScKrylovSolver
+
+    DirichletBC, PETScOptions,
+    assemble, assemble_system, dx, inner, Constant,
+    cells
 )
+
+# PETSc options helper (legacy dolfin)
+from dolfin import PETScOptions
 
 # -----------------------------------------------------------------------------
 # Simple filesystem helpers
@@ -49,7 +60,6 @@ def create_folder_if_not_exists(folder_name: str) -> None:
 # Lightweight checkpointing (NumPy .npz, MPI-aware)
 # -----------------------------------------------------------------------------
 
-
 def _vec_to_array(f) -> np.ndarray:
     return f.vector().get_local()
 
@@ -72,19 +82,14 @@ def load_state(u: Function, filename: str = "./stateBackup/state.npz") -> None:
 _comm = MPI.COMM_WORLD
 
 
-def save_state_mpi(
-    step: int,
-    u: Function,
-    name_tpl: str = "./stateBackup/state_rank{:d}.npz",
-) -> None:
+
+def save_state_mpi(step: int, u: Function, name_tpl: str = "./stateBackup/state_rank{:d}.npz") -> None:
     local = _vec_to_array(u)
     np.savez_compressed(name_tpl.format(_comm.rank), step=step, u=local)
 
 
-def load_state_mpi(
-    u: Function,
-    name_tpl: str = "./stateBackup/state_rank{:d}.npz",
-) -> int:
+
+def load_state_mpi(u: Function, name_tpl: str = "./stateBackup/state_rank{:d}.npz") -> int:
     fname = name_tpl.format(_comm.rank)
     if not os.path.exists(fname):
         print(f"Rank {_comm.rank}: no checkpoint; starting fresh.")
@@ -138,9 +143,8 @@ class DeltaPulse(UserExpression):
 # -----------------------------------------------------------------------------
 
 
-def assign_local_property_vertexBased(
-    mesh: Mesh, value: float, V: FunctionSpace
-) -> Function:
+
+def assign_local_property_vertexBased(mesh: Mesh, value: float, V: FunctionSpace) -> Function:
     kW = Function(V)
     coords = V.tabulate_dof_coordinates().reshape((-1, mesh.geometry().dim()))
     arr = np.full(V.dim(), value)
@@ -150,12 +154,8 @@ def assign_local_property_vertexBased(
     return kW
 
 
-def assign_local_property_vertexBased_celltags(
-    mesh: Mesh,
-    value: float,
-    V: FunctionSpace,
-    cell_tags: MeshFunction,
-) -> Function:
+
+def assign_local_property_vertexBased_celltags(mesh: Mesh, value: float, V: FunctionSpace, cell_tags: MeshFunction) -> Function:
     kW = Function(V)
     arr = np.full(V.dim(), value)
     dofmap = V.dofmap()
@@ -166,12 +166,8 @@ def assign_local_property_vertexBased_celltags(
     return kW
 
 
-def assign_initial_condition_vertex_based(
-    mesh: Mesh,
-    V: FunctionSpace,
-    base_val: float,
-    y_thresh: float = 0.3,
-) -> Function:
+
+def assign_initial_condition_vertex_based(mesh: Mesh, V: FunctionSpace, base_val: float, y_thresh: float = 0.3) -> Function:
     f = Function(V)
     coords = V.tabulate_dof_coordinates().reshape((-1, mesh.geometry().dim()))
     arr = np.empty(V.dim())
@@ -224,7 +220,6 @@ def cellDirVec_DG(mesh: Mesh, vecs: np.ndarray) -> Function:
 # Physiology helpers
 # -----------------------------------------------------------------------------
 
-
 def SHb(domain, CF, solCoef):
     """Hill saturation for haemoglobin (legacy UFL)."""
     P50, n = 26.8, 2.7
@@ -234,7 +229,6 @@ def SHb(domain, CF, solCoef):
 # -----------------------------------------------------------------------------
 # Minimal PETSc Krylov projection helper (legacy API)
 # -----------------------------------------------------------------------------
-
 
 def project_function_legacy(Vt: FunctionSpace, src) -> Function:
     """Cheap projection using assemble + PETScKrylovSolver (classic dolfin)."""
