@@ -163,6 +163,10 @@ W_inv  = inv(W)
 phi_grad = dot(grad(ϕ), v_dir)
 Pw      = W * advU * phi_grad
 
+Pw_vec   = as_vector([advU*phi_grad,    # first component
+                      advU*phi_grad])   # second component
+
+
 # -----------------------------------------------------------------------------
 #  HELPER: weak form of blood operator
 # -----------------------------------------------------------------------------
@@ -205,14 +209,17 @@ for step in range(num_steps):
     consumption = maxG * Ut_safe / (Ut_safe + km + 1e-24)
 
     # Blood residual (incl. SUPG)
-    Fb = 0.5*weakL(ϕ, U_safe, CT) + 0.5*weakL(ϕ, U_safe, CT) \
-         - (0.5*AkVb*Ut*ϕ + 0.5*AkVb*Ut*ϕ)*dx
+    Fb = (
+        0.5 * weakL(ϕ, U_safe, CT)
+        + 0.5 * weakL(ϕ, U_safe, CT)
+        - (0.5 * AkVb * Ut * ϕ + 0.5 * AkVb * Ut * ϕ)
+    ) * dx
 
     if steadySUPG:
         Pe = advU*dL / (2*(Db + Db/65))
         tau = (dL/(2*advU))*(1/tanh(Pe) - 1/Pe) * W_inv
-        Fb += inner(tau*Pw, funR(U, CT, Ut))*dx   # inner-product fix
-
+        # Fb += inner(tau*Pw, funR(U, CT, Ut))*dx   # inner-product fix
+        Fb += dot(tau*Pw_vec, funR(U, CT, Ut)) * dx   # or inner(tauPw, funR(...))*dx
     # Tissue residual – **sign fixed** (+AkVt)
     Ft = ((Ut - Ut_old)/pseudo_dt * ϕt
           + AkVt*(U - Ut)*ϕt                     # ← sign corrected
