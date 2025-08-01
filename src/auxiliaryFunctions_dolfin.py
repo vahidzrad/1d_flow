@@ -11,6 +11,7 @@ Author: Haifeng Wang  ·  Cleanup: ChatGPT (July-2025)
 
 import os
 import shutil
+
 import sys
 import math
 import tempfile
@@ -27,6 +28,7 @@ from petsc4py import PETSc
 from dolfin import (
     Mesh, MeshFunction, FunctionSpace, VectorFunctionSpace, Function,
     TrialFunction, TestFunction, UserExpression, project,
+
     DirichletBC, PETScOptions,
     assemble, assemble_system, dx, inner, Constant,
     cells
@@ -38,6 +40,7 @@ from dolfin import PETScOptions
 # -----------------------------------------------------------------------------
 # Simple filesystem helpers
 # -----------------------------------------------------------------------------
+
 
 def remove_recreate_folder(folder_name: str) -> None:
     """Delete *folder_name* if it exists, then recreate it."""
@@ -79,9 +82,11 @@ def load_state(u: Function, filename: str = "./stateBackup/state.npz") -> None:
 _comm = MPI.COMM_WORLD
 
 
+
 def save_state_mpi(step: int, u: Function, name_tpl: str = "./stateBackup/state_rank{:d}.npz") -> None:
     local = _vec_to_array(u)
     np.savez_compressed(name_tpl.format(_comm.rank), step=step, u=local)
+
 
 
 def load_state_mpi(u: Function, name_tpl: str = "./stateBackup/state_rank{:d}.npz") -> int:
@@ -138,6 +143,7 @@ class DeltaPulse(UserExpression):
 # -----------------------------------------------------------------------------
 
 
+
 def assign_local_property_vertexBased(mesh: Mesh, value: float, V: FunctionSpace) -> Function:
     kW = Function(V)
     coords = V.tabulate_dof_coordinates().reshape((-1, mesh.geometry().dim()))
@@ -146,6 +152,7 @@ def assign_local_property_vertexBased(mesh: Mesh, value: float, V: FunctionSpace
     arr[coords[:, 2] > 0.0] = 0.0
     kW.vector()[:] = arr
     return kW
+
 
 
 def assign_local_property_vertexBased_celltags(mesh: Mesh, value: float, V: FunctionSpace, cell_tags: MeshFunction) -> Function:
@@ -157,6 +164,7 @@ def assign_local_property_vertexBased_celltags(mesh: Mesh, value: float, V: Func
             arr[dofmap.cell_dofs(cell.index())] = 0.0
     kW.vector()[:] = arr
     return kW
+
 
 
 def assign_initial_condition_vertex_based(mesh: Mesh, V: FunctionSpace, base_val: float, y_thresh: float = 0.3) -> Function:
@@ -235,7 +243,7 @@ def project_function_legacy(Vt: FunctionSpace, src) -> Function:
     solver.solve(out.vector(), b)
     return out
 
+
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     print("auxiliaryFunctions_dolfin (legacy) imported OK")
-

@@ -6,6 +6,7 @@ from time import time
 from ufl import tanh, dot, grad, inner, variable
 from mpi4py import MPI
 
+
 base_dir = "/mnt/home/ziaeirad/1d_flow/"
 sys.path.append(base_dir)
 sys.path.append(base_dir + "src")
@@ -53,6 +54,7 @@ OUTLET_TAG = 2  # add more outlet tags here if needed
 P1 = FiniteElement("CG", mesh.ufl_cell(), 1)
 V  = FunctionSpace(mesh, MixedElement([P1, P1]))
 V0, V1 = V.sub(0).collapse(), V.sub(1).collapse()
+
 
 # Mixed unknown function
 U_mixed = Function(V)
@@ -143,6 +145,7 @@ C50 = Constant(2.5 * mmHg_to_mmGs)
 # -----------------------------------------------------------------------------
 U_init  = assign_initial_condition_vertex_based(mesh, V0, 100*pO2C)
 Ut_init = interpolate(Constant(50*pO2C), V1)
+
 FunctionAssigner(V, [V0, V1]).assign(U_mixed, [U_init, Ut_init])
 
 # -----------------------------------------------------------------------------
@@ -181,6 +184,7 @@ def funR(CFn, CTn, CFtn):
 # -----------------------------------------------------------------------------
 #  PSEUDO-TIME LOOP
 # -----------------------------------------------------------------------------
+
 maxG_val      = 70e-12 * Ghypertrophy        # [mol mm⁻³ s⁻¹]
 num_steps     = 10
 pseudo_dt     = Constant(1e2)
