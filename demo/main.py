@@ -5,6 +5,7 @@ import os, sys
 from time import time
 from ufl import tanh, dot, grad, inner, variable
 from mpi4py import MPI
+from petsc4py import PETSc
 
 
 # base_dir = "/mnt/home/ziaeirad/1d_flow/"
@@ -66,11 +67,7 @@ U_mixed = df.Function(V)
 δ  = df.TrialFunction(V)
 ϕ, ϕt = df.split(ψ)            # test functions (blood, tissue)
 # U,  Ut = U_mixed.split()    # unknowns  (blood, tissue)
-U,  Ut = df.split(U_mixed)
-
-# Ensure non-negative arguments in nonlinear terms
-U_safe  = df.conditional(df.gt(U,  0.0), U,  0.0)
-Ut_safe = df.conditional(df.gt(Ut, 0.0), Ut, 0.0)
+U, Ut = df.split(U_mixed)
 
 # -----------------------------------------------------------------------------
 #  AUXILIARY DATA (helpers from external module)
@@ -123,6 +120,8 @@ AkVt   = df.project(kW*Asurf/ Vtis,         V_cg)
 
 # Advection velocity (scalar)
 advU   = df.project(Qcell/Across, V_cg)
+# Floor advection to avoid singular SUPG tau when flow is locally zero
+advU_safe = df.conditional(df.gt(advU, df.DOLFIN_EPS), advU, df.DOLFIN_EPS)
 
 # Vessel direction vectors CG1
 v_dir_DG = cellDirVec_DG(mesh, compute_directional_vectors_cells(mesh))
@@ -190,6 +189,28 @@ def funR(CFn, CTn, CFtn):
     return -ww*(AkVb*CFtn - advU*dot(grad(CTn), v_dir) - AkVb*CFn)
 
 # -----------------------------------------------------------------------------
+# 0.  LINEARISED PRE-SOLVE  (assume CT ≈ CF so CB = 0)
+# -----------------------------------------------------------------------------
+U_lin = df.TrialFunction(V)
+CF_lin, CFt_lin = df.split(U_lin)
+
+# blood operator with CT=CF
+Fb_lin = (weakL(ϕ, CF_lin, CF_lin) - AkVb * CFt_lin * ϕ) * df.dx
+
+# tissue operator, drop nonlinear uptake term
+Ft_lin = (-AkVt * (CF_lin - CFt_lin) * ϕt + Dt * inner(grad(CFt_lin), grad(ϕt))) * df.dx
+
+a_lin = df.lhs(Fb_lin + Ft_lin)
+L_lin = df.rhs(Fb_lin + Ft_lin)
+df.solve(a_lin == L_lin, U_mixed, bcs)
+
+CF_sol, CFt_sol = U_mixed.split()
+F_res = ((weakL(ϕ, CF_sol, CF_sol) - AkVb * CFt_sol * ϕ)
+         + (-AkVt * (CF_sol - CFt_sol) * ϕt
+            + Dt * inner(grad(CFt_sol), grad(ϕt)))) * df.dx
+print("Linear warm-start ‖R‖ =", df.assemble(F_res).norm("l2"))
+
+# -----------------------------------------------------------------------------
 #  PSEUDO-TIME LOOP
 # -----------------------------------------------------------------------------
 
@@ -208,20 +229,19 @@ for step in range(num_steps):
                                              V0)
 
     # Derived fields
-    CB = variable(4*CHb*Hct*SHb(mesh, U_safe, pO2C))
-    CT = CB + U_safe
-    consumption = maxG * Ut_safe / (Ut_safe + km + 1e-24)
+    CB = variable(4*CHb*Hct*SHb(mesh, U, pO2C))
+    CT = CB + U
+    consumption = variable(maxG * Ut / (Ut + km + 1e-24))
 
     # Blood residual (incl. SUPG)
     Fb = (
-        0.5 * weakL(ϕ, U_safe, CT)
-        + 0.5 * weakL(ϕ, U_safe, CT)
-        - (0.5 * AkVb * Ut * ϕ + 0.5 * AkVb * Ut * ϕ)
+        weakL(ϕ, U, CT)
+        - AkVb * Ut * ϕ
     ) * df.dx
 
     if steadySUPG:
-        Pe = advU*dL / (2*(Db + Db/65))
-        tau = (dL/(2*advU))*(1/tanh(Pe) - 1/Pe) * W_inv
+        Pe = advU_safe*dL / (2*(Db + Db/65))
+        tau = (dL/(2*advU_safe))*(1/tanh(Pe) - 1/Pe) * W_inv
         # Fb += inner(tau*Pw, funR(U, CT, Ut))*df.dx   # inner-product fix
         Fb += dot(tau*Pw_vec, funR(U, CT, Ut)) * df.dx   # or inner(tauPw, funR(...))*df.dx
     # Tissue residual – **sign fixed** (+AkVt)
@@ -232,54 +252,41 @@ for step in range(num_steps):
           + Dmb*CMb*inner(grad(Ut/(Ut + C50)), grad(ϕt))
           )*df.dx
 
-    F  = Fb + Ft
-    J  = df.derivative(F, U_mixed, δ)
-
-
-for step in range(num_steps):
-    print(f"\n=== pseudo-time {step+1}/{num_steps} ===")
-
-    # Update metabolism, derived fields, weak forms...
-    # ... (same as before) ...
-
     F = Fb + Ft
-    J = derivative(F, U_mixed, δ)
+    J = df.derivative(F, U_mixed, δ)
 
     # -----------------------------------------------
-    # INSERT TAO BLOCK HERE (replaces old FEniCS solver)
+    # TAO nonlinear solve
     # -----------------------------------------------
-    A = PETScMatrix(); assemble(J, tensor=A)
-    b = PETScVector(); assemble(F, tensor=b)
-    x = as_backend_type(U_mixed.vector()).vec()
-
-    x_vec = as_backend_type(U_mixed.vector()).vec()
+    A = df.PETScMatrix(); df.assemble(J, tensor=A)
+    b = df.PETScVector(); df.assemble(F, tensor=b)
+    x = df.as_backend_type(U_mixed.vector()).vec()
     tao = PETSc.TAO().create(commMPI)
     tao.setType("tron")
 
     def objective(tao_, x_):
-        x.copy(result=x)
-        assemble(F, tensor=b)
+        x_.copy(result=x)
+        df.assemble(F, tensor=b)
         return 0.5 * b.norm("l2")**2
 
     def gradient(tao_, x_, g_):
-        assemble(F, tensor=b)
-        g_.copy(result=b.vec())
+        x_.copy(result=x)
+        df.assemble(F, tensor=b)
+        df.assemble(J, tensor=A)
+        Amat = df.as_backend_type(A).mat()
+        Amat.multTranspose(b.vec(), g_)
 
     def hessian(tao_, x_, H_, P_):
-        assemble(J, tensor=A)
-        Amat = as_backend_type(A).mat()
-        H_.setValuesCSR(*Amat.getValuesCSR())
+        x_.copy(result=x)
+        df.assemble(J, tensor=A)
+        Amat = df.as_backend_type(A).mat()
+        JtJ = Amat.transposeMatMult(Amat)
+        H_.setValuesCSR(*JtJ.getValuesCSR())
         H_.assemble()
 
     tao.setObjective(objective)
     tao.setGradient(gradient)
     tao.setHessian(hessian)
-
-    lb_fun = Function(V); lb_fun.vector()[:] = 0.0
-    ub_fun = Function(V); ub_fun.vector()[:] = np.inf
-    lb = as_backend_type(lb_fun.vector()).vec()
-    ub = as_backend_type(ub_fun.vector()).vec()
-    tao.setVariableBounds(lb, ub)
 
     ksp = tao.getKSP()
     ksp.setType("preonly")
@@ -287,57 +294,7 @@ for step in range(num_steps):
 
     tao.setTolerances(gatol=1e-8, grtol=1e-6)
     tao.setFromOptions()
-    tao.solve(x_vec)
-
-    if True:
-        sys.exit(0)
-
-    # -----------------------------------------------
-    # rest of your loop stays the same
-    # -----------------------------------------------
-    _, Ut_new = U_mixed.split(deepcopy=True)
-    Ut_old.assign(Ut_new)
-
-    # Output to XDMF (unchanged)
-    ...
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    problem = df.NonlinearVariationalProblem(F, U_mixed, bcs, J)
-    solver  = df.NonlinearVariationalSolver(problem)
-    prm = solver.parameters["snes_solver"]
-    prm.update({"report": True,
-                "absolute_tolerance": 1e-13,
-                "maximum_iterations": 1000,
-                "linear_solver": "lu"})
-
-    solver.solve()
+    tao.solve(x)
 
     # Update pseudo-time variable
     _, Ut_new = U_mixed.split(deepcopy=True)
@@ -353,5 +310,32 @@ for step in range(num_steps):
         _, Utissue = U_mixed.split()
         Utissue.rename("CFt", "")
         xt.write(Utissue)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 print(f"Total runtime: {time() - start_time:.1f} s")
