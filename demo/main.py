@@ -8,7 +8,8 @@ from mpi4py import MPI
 from petsc4py import PETSc
 
 
-base_dir = "/home/ziaeirad/1d_flow/"
+# base_dir = "/home/ziaeirad/1d_flow/"
+base_dir = "/mnt/home/ziaeirad/1d_flow_dev/"
 # base_dir = "/workspace"
 # base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -242,13 +243,43 @@ Ft_lin = (-AkVt * (CF_lin - CFt_lin) * phi_t + Dt * df.inner(df.grad(CFt_lin), d
 try:
     a_lin = df.lhs(Fb_lin + Ft_lin)
     L_lin = df.rhs(Fb_lin + Ft_lin)
-    # Assemble and solve with LU; catch failures non-fatally
-    A_lin, b_lin = df.assemble_system(a_lin, L_lin, bcs)
-    lin_solver = df.LUSolver()
-    lin_solver.solve(A_lin, U_mixed.vector(), b_lin)
-except Exception as e:
-    if rank == 0:
-        print("Linear warm-start failed, continuing with initial guess:", repr(e))
+    # Prefer the most robust pathway first; avoid triggering backend-specific errors
+    df.solve(a_lin == L_lin, U_mixed, bcs)
+except Exception:
+    # Try LinearVariationalSolver, then direct LU, then Krylov; stay quiet unless everything fails
+    solved = False
+    try:
+        problem_lin = df.LinearVariationalProblem(a_lin, L_lin, U_mixed, bcs)
+        solver_lin = df.LinearVariationalSolver(problem_lin)
+        try:
+            solver_lin.parameters["linear_solver"] = "lu"
+        except Exception:
+            pass
+        solver_lin.solve()
+        solved = True
+    except Exception:
+        pass
+    if not solved:
+        try:
+            A_lin, b_lin = df.assemble_system(a_lin, L_lin, bcs)
+            lin_solver = df.LUSolver()
+            lin_solver.solve(A_lin, U_mixed.vector(), b_lin)
+            solved = True
+        except Exception:
+            pass
+    if not solved:
+        try:
+            A_lin, b_lin = df.assemble_system(a_lin, L_lin, bcs)
+            ksp = df.KrylovSolver("gmres", "ilu")
+            ksp.parameters["monitor_convergence"] = False
+            ksp.parameters["relative_tolerance"] = 1e-10
+            ksp.parameters["absolute_tolerance"] = 1e-12
+            ksp.parameters["maximum_iterations"] = 500
+            ksp.solve(A_lin, U_mixed.vector(), b_lin)
+            solved = True
+        except Exception as e4:
+            if rank == 0:
+                print("Linear warm-start failed, continuing with initial guess:", repr(e4))
 
 CF_sol, CFt_sol = U_mixed.split()
 F_res = ((weakL(phi_b, CF_sol, CF_sol) - AkVb * CFt_sol * phi_b)
