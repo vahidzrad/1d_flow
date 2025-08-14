@@ -1,20 +1,15 @@
 import dolfin as df
 import numpy as np
 import scipy.io as sio
-import os, sys
+import os, sys, json
 from time import time
 from ufl import tanh, variable, max_value
 from mpi4py import MPI
 from petsc4py import PETSc
+from pathlib import Path
 
-
-# base_dir = "/home/ziaeirad/1d_flow/"
-base_dir = "/mnt/home/ziaeirad/1d_flow_dev/"
-# base_dir = "/workspace"
-# base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-sys.path.append(base_dir)
-sys.path.append(base_dir + "src")
+base_dir = "/workspace"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 # -----------------------------------------------------------------------------
 # INITIAL SET-UP
@@ -41,6 +36,56 @@ except Exception:
 
 # Ensure output folder exists
 os.makedirs("./results_1876v", exist_ok=True)
+CKPT_META = os.path.join("./results_1876v", "checkpoint_meta.json")
+CKPT_H5   = os.path.join("./results_1876v", "checkpoint.h5")
+
+def save_checkpoint(U_mix, step_idx, pseudo_dt_val):
+    """Save mixed solution split into components, plus metadata.
+    Only rank 0 writes metadata; all ranks participate in HDF5 write.
+    """
+    comm = MPI.COMM_WORLD
+    try:
+        Ublood, Utissue = U_mix.split()
+        with df.HDF5File(comm, CKPT_H5, "w") as h5:
+            Ublood.rename("CFb", "")
+            Utissue.rename("CFt", "")
+            h5.write(Ublood, "CFb")
+            h5.write(Utissue, "CFt")
+        if comm.Get_rank() == 0:
+            with open(CKPT_META, "w") as f:
+                json.dump({
+                    "last_completed_step": int(step_idx),  # 0-based
+                    "pseudo_dt": float(pseudo_dt_val)
+                }, f)
+    except Exception as e:
+        if MPI.COMM_WORLD.Get_rank() == 0:
+            print("Warning: checkpoint save failed:", repr(e))
+
+def load_checkpoint(U_mix):
+    """Load mixed solution from checkpoint if present. Returns (found, last_step, pseudo_dt)."""
+    comm = MPI.COMM_WORLD
+    if not (os.path.exists(CKPT_META) and os.path.exists(CKPT_H5)):
+        return False, -1, None
+    try:
+        if comm.Get_rank() == 0:
+            with open(CKPT_META, "r") as f:
+                meta = json.load(f)
+        else:
+            meta = None
+        meta = comm.bcast(meta, root=0)
+
+        CFb_fn = df.Function(V0)
+        CFt_fn = df.Function(V1)
+        with df.HDF5File(comm, CKPT_H5, "r") as h5:
+            h5.read(CFb_fn, "CFb")
+            h5.read(CFt_fn, "CFt")
+        df.FunctionAssigner(V, [V0, V1]).assign(U_mix, [CFb_fn, CFt_fn])
+
+        return True, int(meta.get("last_completed_step", -1)), float(meta.get("pseudo_dt", 0.1))
+    except Exception as e:
+        if comm.Get_rank() == 0:
+            print("Warning: checkpoint load failed, starting fresh:", repr(e))
+        return False, -1, None
 
 # Constants and conversion factors
 mL_to_mm = 1000.0                      # mL → mm³
@@ -295,9 +340,28 @@ maxG_val      = 70e-12 * Ghypertrophy        # [mol mm⁻³ s⁻¹]
 num_steps     = 10
 pseudo_dt     = df.Constant(0.1)      # stronger transient damping for Newton
 
+# Resume support: if checkpoint exists, load and continue
+resume_found, last_step_done, ckpt_dt = load_checkpoint(U_mixed)
+start_step = 0
+if resume_found:
+    start_step = last_step_done + 1
+    if ckpt_dt is not None:
+        try:
+            pseudo_dt.assign(ckpt_dt)
+        except Exception:
+            pseudo_dt.assign(df.Constant(ckpt_dt))
+    # Keep pseudo-time state consistent on resume
+    try:
+        _, _Ut_resume = U_mixed.split(deepcopy=True)
+        Ut_old.assign(_Ut_resume)
+    except Exception:
+        pass
+    if rank == 0:
+        print(f"Resuming from checkpoint at step {start_step}/{num_steps}")
+
 _, Ut_old = U_mixed.split(deepcopy=True)
 
-for step in range(num_steps):
+for step in range(start_step, num_steps):
     print(f"\n=== pseudo-time {step+1}/{num_steps} ===")
 
     # Ramp metabolism: zero on first step, then gradual
@@ -345,7 +409,7 @@ for step in range(num_steps):
         Fb += df.dot(tau*Pw_vec, funR(U, CT, Ut)) * df.dx
     # Tissue residual – **sign fixed** (+AkVt)
     Ft = ((Ut - Ut_old)/pseudo_dt * phi_t
-          + AkVt*(U - Ut)*phi_t
+          - AkVt*(U - Ut)*phi_t
           + consumption*phi_t
           + Dt*df.inner(df.grad(Ut), df.grad(phi_t))
           + Dmb*CMb*df.inner(df.grad(Ut/(Ut + C50)), df.grad(phi_t))
@@ -380,23 +444,64 @@ for step in range(num_steps):
         prm["newton_solver"]["line_search"] = "bt"
     except Exception:
         pass
+
+    # Retry with pseudo_dt backoff if failure occurs
+    max_retries = 5
+    try_id = 0
+    success_local = 0
+    current_dt = None
+    try:
+        current_dt = float(pseudo_dt.values()[0])
+    except Exception:
+        # Fallback if Constant API differs
+        current_dt = 0.1
     U_prev = U_mixed.copy(deepcopy=True)
-    solver.solve()
-    _vec = U_mixed.vector().get_local()
-    if not np.all(np.isfinite(_vec)):
-        if rank == 0:
-            print("Non-finite values detected after Newton; reverting and damping.")
+    while try_id < max_retries:
+        # Update Constant in case it changed
+        try:
+            pseudo_dt.assign(current_dt)
+        except Exception:
+            pseudo_dt.assign(df.Constant(current_dt))
+
+        try:
+            solver.solve()
+            vec = U_mixed.vector().get_local()
+            if np.all(np.isfinite(vec)):
+                success_local = 1
+            else:
+                success_local = 0
+        except Exception as e:
+            success_local = 0
+
+        # MPI agreement: all ranks must succeed
+        success_global = MPI.COMM_WORLD.allreduce(success_local, op=MPI.MIN)
+        if success_global == 1:
+            break
+
+        # Revert and back off dt, clamp negatives
         df.FunctionAssigner(V, [V0, V1]).assign(U_mixed, U_prev.split())
-        _vec = U_mixed.vector().get_local()
-        _vec[_vec < 0.0] = 0.0
-        U_mixed.vector().set_local(_vec)
+        vloc = U_mixed.vector().get_local()
+        vloc[~np.isfinite(vloc)] = 0.0
+        vloc[vloc < 0.0] = 0.0
+        U_mixed.vector().set_local(vloc)
         U_mixed.vector().apply("insert")
+
+        current_dt = max(current_dt/2.0, 1e-4)
+        if rank == 0:
+            print(f"Solve failed on try {try_id+1}; reducing dt to {current_dt:.4e} and retrying.")
+        try_id += 1
+
+    if try_id == max_retries and success_local == 0:
+        if rank == 0:
+            print("Step failed after retries; stopping early. Last completed step is saved.")
+        # Save the last successful checkpoint of previous step is already on disk
+        break
 
     # Update pseudo-time variable
     _, Ut_new = U_mixed.split(deepcopy=True)
     Ut_old.assign(Ut_new)
 
-    # Write results
+    # Write results and checkpoint
     sid = step+1
     with df.XDMFFile(commMPI, f"./results_1876v/CFb_step_{sid:02d}.xdmf") as xb:
         Ublood, _ = U_mixed.split()
@@ -406,5 +511,8 @@ for step in range(num_steps):
         _, Utissue = U_mixed.split()
         Utissue.rename("CFt", "")
         xt.write(Utissue)
+
+    # Persist checkpoint for resume (0-based step index)
+    save_checkpoint(U_mixed, step, current_dt)
 
 print(f"Total runtime: {time() - start_time:.1f} s")
