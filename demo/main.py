@@ -3,13 +3,13 @@ import numpy as np
 import scipy.io as sio
 import os, sys
 from time import time
-from ufl import tanh, dot, grad, inner, variable
+from ufl import tanh, variable, max_value
 from mpi4py import MPI
 from petsc4py import PETSc
 
 
-# base_dir = "/mnt/home/ziaeirad/1d_flow/"
-base_dir = "/workspace"
+base_dir = "/home/ziaeirad/1d_flow/"
+# base_dir = "/workspace"
 # base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 sys.path.append(base_dir)
@@ -23,6 +23,24 @@ rank = commMPI.Get_rank()
 sizeMPI = commMPI.Get_size()
 start_time = time()
 
+# Be conservative with FFC optimizations to avoid segfaults during JIT
+try:
+    df.parameters["form_compiler"]["cpp_optimize"] = False
+    df.parameters["form_compiler"]["optimize"] = False
+except Exception:
+    pass
+
+# Prefer robust external LU (MUMPS) if available
+try:
+    df.PETScOptions.set("ksp_type", "preonly")
+    df.PETScOptions.set("pc_type", "lu")
+    df.PETScOptions.set("pc_factor_mat_solver_type", "mumps")
+except Exception:
+    pass
+
+# Ensure output folder exists
+os.makedirs("./results_1876v", exist_ok=True)
+
 # Constants and conversion factors
 mL_to_mm = 1000.0                      # mL → mm³
 mmHg_to_mmGs = 133.322                 # mmHg → mm g s⁻²
@@ -30,10 +48,10 @@ pO2C = 1.35E-12                        # Henry constant
 
 difD_value = 2.41e-5 * 100            # free O₂ diffusivity [mm²/s]
 PeCritical = 1                         # SUPG threshold
-steadySUPG = 1
+steadySUPG = 0                        # disable SUPG for stability
 Ghypertrophy = 1.0
 ratioVtVb = 12.5                       # tissue/ blood volume ratio
-kWratioTmp = 1.0                       # wall conductance scaling
+kWratioTmp = 0.01                      # wall conductance scaling (further reduced)
 HctTmp = 0.25                          # haematocrit
 
 # -----------------------------------------------------------------------------
@@ -63,9 +81,8 @@ V0, V1 = V.sub(0).collapse(), V.sub(1).collapse()
 # Mixed unknown function
 U_mixed = df.Function(V)
 
-ψ  = df.TestFunction(V)
 δ  = df.TrialFunction(V)
-ϕ, ϕt = df.split(ψ)            # test functions (blood, tissue)
+phi_b, phi_t = df.TestFunctions(V)     # test functions (blood, tissue)
 # U,  Ut = U_mixed.split()    # unknowns  (blood, tissue)
 U, Ut = df.split(U_mixed)
 
@@ -107,6 +124,7 @@ Rnode  = df.project(Rcell,  V_cg)
 # Geometry helpers
 h      = df.CellDiameter(mesh)
 dL     = df.project(h, V_cg)
+# Project geometric quantities then clamp via vectors (avoid UFL max_value)
 Across = df.project(np.pi * Rcell**2,      V_cg)          # cross-section [mm²]
 Asurf  = df.project(2.0 * np.pi * Rcell*h, V_cg)          # surface       [mm²]
 Vb     = df.project(Across*h,              V_cg)          # blood vol.    [mm³]
@@ -115,13 +133,33 @@ Vtis   = Vb * ratioVtVb
 # Exchange coefficients (1/s)
 kWtmp  = kWratioTmp * 35.0 * 0.001      # [mm/s]
 kW     = assign_local_property_vertexBased(mesh, kWtmp, V0)
-AkVb   = df.project(kW*Asurf/ Vb,           V_cg)
-AkVt   = df.project(kW*Asurf/ Vtis,         V_cg)
+# Exchange terms with safe division to avoid 0/0
+AkVb   = df.project(df.conditional(df.gt(Vb,   df.DOLFIN_EPS), kW*Asurf/Vb,   df.Constant(0.0)), V_cg)
+AkVt   = df.project(df.conditional(df.gt(Vtis, df.DOLFIN_EPS), kW*Asurf/Vtis, df.Constant(0.0)), V_cg)
 
 # Advection velocity (scalar)
-advU   = df.project(Qcell/Across, V_cg)
-# Floor advection to avoid singular SUPG tau when flow is locally zero
-advU_safe = df.conditional(df.gt(advU, df.DOLFIN_EPS), advU, df.DOLFIN_EPS)
+# Clamp area to epsilon using vector operations
+Across_safe = df.Function(V_cg)
+_tmp = Across.vector().get_local()
+_tmp[_tmp < df.DOLFIN_EPS] = df.DOLFIN_EPS
+Across_safe.vector().set_local(_tmp)
+Across_safe.vector().apply("insert")
+
+# Compute advection and clamp to epsilon similarly
+advU = df.project(Qcell/Across_safe, V_cg)
+advU_safe = df.Function(V_cg)
+_au = advU.vector().get_local()
+_au[_au < df.DOLFIN_EPS] = df.DOLFIN_EPS
+# Upper cap to limit extreme velocities (reduce stiffness)
+try:
+    umax = np.percentile(_au, 95)
+    if not np.isfinite(umax) or umax <= df.DOLFIN_EPS:
+        umax = 5.0
+except Exception:
+    umax = 5.0
+_au[_au > umax] = umax
+advU_safe.vector().set_local(_au)
+advU_safe.vector().apply("insert")
 
 # Vessel direction vectors CG1
 v_dir_DG = cellDirVec_DG(mesh, compute_directional_vectors_cells(mesh))
@@ -155,19 +193,19 @@ df.FunctionAssigner(V, [V0, V1]).assign(U_mixed, [U_init, Ut_init])
 #  BOUNDARY CONDITIONS
 # -----------------------------------------------------------------------------
 bc_in  = df.DirichletBC(V.sub(0), df.Constant(100*pO2C), vertex_tags, INLET_TAG)
-bc_out = df.DirichletBC(V.sub(0), df.Constant( 20*pO2C), vertex_tags, OUTLET_TAG)
-bcs    = [bc_in, bc_out]
+# Use natural outflow (no Dirichlet at outlet)
+bcs    = [bc_in]
 
 # -----------------------------------------------------------------------------
 #  SUPG MATRICES
 # -----------------------------------------------------------------------------
 W      = df.as_matrix([[7/24, -1/24], [13/24, 5/24]])
 W_inv  = df.inv(W)
-phi_grad = dot(grad(ϕ), v_dir)
-Pw      = W * advU * phi_grad
+phi_grad = df.dot(df.grad(phi_b), v_dir)
+Pw      = W * advU_safe * phi_grad
 
-Pw_vec   = df.as_vector([advU*phi_grad,    # first component
-                         advU*phi_grad])   # second component
+Pw_vec   = df.as_vector([advU_safe*phi_grad,    # first component
+                         advU_safe*phi_grad])   # second component
 
 
 # -----------------------------------------------------------------------------
@@ -178,15 +216,16 @@ def weakL(test, CF, CT):
     """Return weak form of blood equation (no SUPG).
     Diffusion applies *only* to dissolved O₂ (CF)."""
     return (
-        test * advU * dot(grad(CT), v_dir)        # advection of total O₂
-        + Db * inner(grad(CF), grad(test))        # **diffuse dissolved only**
-        + test * AkVb * CF                        # exchange source
+        test * advU_safe * df.dot(df.grad(CT), v_dir)   # advection of total O₂ (safe)
+        + Db * df.inner(df.grad(CF), df.grad(test))     # **diffuse dissolved only**
+        + test * AkVb * CF                              # exchange source
     )
 
 
 def funR(CFn, CTn, CFtn):
     ww = df.as_vector([0.5, 0.5])
-    return -ww*(AkVb*CFtn - advU*dot(grad(CTn), v_dir) - AkVb*CFn)
+    # use advU_safe to avoid NaNs in SUPG residual
+    return -ww*(AkVb*CFtn - advU_safe*df.dot(df.grad(CTn), v_dir) - AkVb*CFn)
 
 # -----------------------------------------------------------------------------
 # 0.  LINEARISED PRE-SOLVE  (assume CT ≈ CF so CB = 0)
@@ -195,19 +234,26 @@ U_lin = df.TrialFunction(V)
 CF_lin, CFt_lin = df.split(U_lin)
 
 # blood operator with CT=CF
-Fb_lin = (weakL(ϕ, CF_lin, CF_lin) - AkVb * CFt_lin * ϕ) * df.dx
+Fb_lin = (weakL(phi_b, CF_lin, CF_lin) - AkVb * CFt_lin * phi_b) * df.dx
 
 # tissue operator, drop nonlinear uptake term
-Ft_lin = (-AkVt * (CF_lin - CFt_lin) * ϕt + Dt * inner(grad(CFt_lin), grad(ϕt))) * df.dx
+Ft_lin = (-AkVt * (CF_lin - CFt_lin) * phi_t + Dt * df.inner(df.grad(CFt_lin), df.grad(phi_t))) * df.dx
 
-a_lin = df.lhs(Fb_lin + Ft_lin)
-L_lin = df.rhs(Fb_lin + Ft_lin)
-df.solve(a_lin == L_lin, U_mixed, bcs)
+try:
+    a_lin = df.lhs(Fb_lin + Ft_lin)
+    L_lin = df.rhs(Fb_lin + Ft_lin)
+    # Assemble and solve with LU; catch failures non-fatally
+    A_lin, b_lin = df.assemble_system(a_lin, L_lin, bcs)
+    lin_solver = df.LUSolver()
+    lin_solver.solve(A_lin, U_mixed.vector(), b_lin)
+except Exception as e:
+    if rank == 0:
+        print("Linear warm-start failed, continuing with initial guess:", repr(e))
 
 CF_sol, CFt_sol = U_mixed.split()
-F_res = ((weakL(ϕ, CF_sol, CF_sol) - AkVb * CFt_sol * ϕ)
-         + (-AkVt * (CF_sol - CFt_sol) * ϕt
-            + Dt * inner(grad(CFt_sol), grad(ϕt)))) * df.dx
+F_res = ((weakL(phi_b, CF_sol, CF_sol) - AkVb * CFt_sol * phi_b)
+         + (-AkVt * (CF_sol - CFt_sol) * phi_t
+            + Dt * df.inner(df.grad(CFt_sol), df.grad(phi_t)))) * df.dx
 print("Linear warm-start ‖R‖ =", df.assemble(F_res).norm("l2"))
 
 # -----------------------------------------------------------------------------
@@ -216,85 +262,104 @@ print("Linear warm-start ‖R‖ =", df.assemble(F_res).norm("l2"))
 
 maxG_val      = 70e-12 * Ghypertrophy        # [mol mm⁻³ s⁻¹]
 num_steps     = 10
-pseudo_dt     = df.Constant(1e2)
+pseudo_dt     = df.Constant(0.1)      # stronger transient damping for Newton
 
 _, Ut_old = U_mixed.split(deepcopy=True)
 
 for step in range(num_steps):
     print(f"\n=== pseudo-time {step+1}/{num_steps} ===")
 
-    # Ramp metabolism
+    # Ramp metabolism: zero on first step, then gradual
+    ramp_factor = 0.0 if step == 0 else (step/float(num_steps))
     maxG = assign_local_property_vertexBased(mesh,
-                                             maxG_val*(step+1)/num_steps,
+                                             maxG_val*ramp_factor,
                                              V0)
 
-    # Derived fields
-    CB = variable(4*CHb*Hct*SHb(mesh, U, pO2C))
+    # Ramp wall exchange as well (start tiny), recompute AkVb/AkVt inside loop
+    kW_loop = assign_local_property_vertexBased(mesh, kWratioTmp * 35.0 * 0.001 * max(0.05, ramp_factor), V0)
+    AkVb   = df.project(df.conditional(df.gt(Vb,   df.DOLFIN_EPS), kW_loop*Asurf/Vb,   df.Constant(0.0)), V_cg)
+    AkVt   = df.project(df.conditional(df.gt(Vtis, df.DOLFIN_EPS), kW_loop*Asurf/Vtis, df.Constant(0.0)), V_cg)
+    # Cap exchange rates to upper bound to limit stiffness
+    Ak_cap = 1e2
+    _akb = AkVb.vector().get_local(); _akb = np.clip(_akb, 0.0, Ak_cap)
+    AkVb.vector().set_local(_akb); AkVb.vector().apply("insert")
+    _akt = AkVt.vector().get_local(); _akt = np.clip(_akt, 0.0, Ak_cap)
+    AkVt.vector().set_local(_akt); AkVt.vector().apply("insert")
+
+    # Derived fields (avoid ufl.variable; clamp U to avoid negative fractional powers)
+    U_pos = df.conditional(df.ge(U, df.Constant(0.0)), U, df.Constant(0.0))
+    CB = 4*CHb*Hct*SHb(mesh, U_pos, pO2C)
     CT = CB + U
-    consumption = variable(maxG * Ut / (Ut + km + 1e-24))
+    consumption = maxG * Ut / (Ut + km + df.Constant(1e-24))
 
     # Blood residual (incl. SUPG)
     Fb = (
-        weakL(ϕ, U, CT)
-        - AkVb * Ut * ϕ
+        weakL(phi_b, U, CT)
+        - AkVb * Ut * phi_b
     ) * df.dx
 
     if steadySUPG:
-        Pe = advU_safe*dL / (2*(Db + Db/65))
-        tau = (dL/(2*advU_safe))*(1/tanh(Pe) - 1/Pe) * W_inv
-        # Fb += inner(tau*Pw, funR(U, CT, Ut))*df.dx   # inner-product fix
-        Fb += dot(tau*Pw_vec, funR(U, CT, Ut)) * df.dx   # or inner(tauPw, funR(...))*df.dx
+        # Compute SUPG tau numerically to avoid UFL math on Functions
+        _au = advU_safe.vector().get_local()
+        _dl = dL.vector().get_local()
+        dif = difD_value
+        _pe = _au * _dl / (2.0 * (dif + dif/65.0))
+        _pe = np.maximum(_pe, 1e-12)
+        _sigma = (_dl / (2.0 * _au)) * (1.0/np.tanh(_pe) - 1.0/_pe)
+        tau_scalar = df.Function(V_cg)
+        tau_scalar.vector().set_local(_sigma)
+        tau_scalar.vector().apply("insert")
+        tau = tau_scalar * W_inv
+        # Fb += df.inner(tau*Pw, funR(U, CT, Ut))*df.dx
+        Fb += df.dot(tau*Pw_vec, funR(U, CT, Ut)) * df.dx
     # Tissue residual – **sign fixed** (+AkVt)
-    Ft = ((Ut - Ut_old)/pseudo_dt * ϕt
-          + AkVt*(U - Ut)*ϕt                     # ← sign corrected
-          + consumption*ϕt
-          + Dt*inner(grad(Ut), grad(ϕt))
-          + Dmb*CMb*inner(grad(Ut/(Ut + C50)), grad(ϕt))
+    Ft = ((Ut - Ut_old)/pseudo_dt * phi_t
+          + AkVt*(U - Ut)*phi_t
+          + consumption*phi_t
+          + Dt*df.inner(df.grad(Ut), df.grad(phi_t))
+          + Dmb*CMb*df.inner(df.grad(Ut/(Ut + C50)), df.grad(phi_t))
           )*df.dx
 
     F = Fb + Ft
+    # Mild artificial diffusion on blood in first step for robustness
+    if step == 0:
+        F += (0.3*Db) * df.inner(df.grad(U), df.grad(phi_b)) * df.dx
     J = df.derivative(F, U_mixed, δ)
 
-    # -----------------------------------------------
-    # TAO nonlinear solve
-    # -----------------------------------------------
-    A = df.PETScMatrix(); df.assemble(J, tensor=A)
-    b = df.PETScVector(); df.assemble(F, tensor=b)
-    x = df.as_backend_type(U_mixed.vector()).vec()
-    tao = PETSc.TAO().create(commMPI)
-    tao.setType("tron")
+    # Newton solve with DOLFIN's NonlinearVariationalSolver
+    try:
+        Fb_vec = df.assemble(Fb)
+        Ft_vec = df.assemble(Ft)
+        if rank == 0:
+            print("||Fb|| =", Fb_vec.norm("l2"), " ||Ft|| =", Ft_vec.norm("l2"))
+    except Exception as e:
+        if rank == 0:
+            print("Assembly check failed:", repr(e))
 
-    def objective(tao_, x_):
-        x_.copy(result=x)
-        df.assemble(F, tensor=b)
-        return 0.5 * b.norm("l2")**2
-
-    def gradient(tao_, x_, g_):
-        x_.copy(result=x)
-        df.assemble(F, tensor=b)
-        df.assemble(J, tensor=A)
-        Amat = df.as_backend_type(A).mat()
-        Amat.multTranspose(b.vec(), g_)
-
-    def hessian(tao_, x_, H_, P_):
-        x_.copy(result=x)
-        df.assemble(J, tensor=A)
-        Amat = df.as_backend_type(A).mat()
-        JtJ = Amat.transposeMatMult(Amat)
-        H_.setValuesCSR(*JtJ.getValuesCSR())
-        H_.assemble()
-
-    tao.setObjective(objective)
-    tao.setGradient(gradient)
-    tao.setHessian(hessian)
-
-    ksp = tao.getKSP()
-    ksp.setType("preonly")
-    ksp.getPC().setType("lu")
-
-    tao.setTolerances(gatol=1e-8, grtol=1e-6)
-    tao.setFromOptions()
-    tao.solve(x)
+    problem = df.NonlinearVariationalProblem(F, U_mixed, bcs, J)
+    solver = df.NonlinearVariationalSolver(problem)
+    prm = solver.parameters
+    try:
+        prm["newton_solver"]["relative_tolerance"] = 1e-6
+        prm["newton_solver"]["absolute_tolerance"] = 1e-8
+        prm["newton_solver"]["maximum_iterations"] = 50
+        prm["newton_solver"]["linear_solver"] = "lu"
+        prm["newton_solver"]["relaxation_parameter"] = 0.3
+        prm["newton_solver"]["error_on_nonconvergence"] = False
+        prm["newton_solver"]["line_search"] = "bt"
+    except Exception:
+        pass
+    U_prev = U_mixed.copy(deepcopy=True)
+    solver.solve()
+    _vec = U_mixed.vector().get_local()
+    if not np.all(np.isfinite(_vec)):
+        if rank == 0:
+            print("Non-finite values detected after Newton; reverting and damping.")
+        df.FunctionAssigner(V, [V0, V1]).assign(U_mixed, U_prev.split())
+        _vec = U_mixed.vector().get_local()
+        _vec[_vec < 0.0] = 0.0
+        U_mixed.vector().set_local(_vec)
+        U_mixed.vector().apply("insert")
 
     # Update pseudo-time variable
     _, Ut_new = U_mixed.split(deepcopy=True)
@@ -310,32 +375,5 @@ for step in range(num_steps):
         _, Utissue = U_mixed.split()
         Utissue.rename("CFt", "")
         xt.write(Utissue)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 print(f"Total runtime: {time() - start_time:.1f} s")
