@@ -26,12 +26,24 @@ from petsc4py import PETSc
 # Legacy FEniCS imports
 # -----------------------------------------------------------------------------
 from dolfin import (
-    Mesh, MeshFunction, FunctionSpace, VectorFunctionSpace, Function,
-    TrialFunction, TestFunction, UserExpression, project,
-
-    DirichletBC, PETScOptions,
-    assemble, assemble_system, dx, inner, Constant,
-    cells
+    Mesh,
+    MeshFunction,
+    FunctionSpace,
+    VectorFunctionSpace,
+    Function,
+    TrialFunction,
+    TestFunction,
+    UserExpression,
+    project,
+    DirichletBC,
+    PETScOptions,
+    PETScKrylovSolver,
+    assemble,
+    assemble_system,
+    dx,
+    inner,
+    Constant,
+    cells,
 )
 
 # PETSc options helper (legacy dolfin)
@@ -43,22 +55,34 @@ from dolfin import PETScOptions
 
 
 def remove_recreate_folder(folder_name: str) -> None:
-    """Delete *folder_name* if it exists, then recreate it."""
+    """Delete *folder_name* if it exists, then recreate it.
+
+    Parallel-friendly: only rank 0 touches the filesystem; all ranks wait.
+    """
     folder_path = os.path.abspath(folder_name)
-    if os.path.exists(folder_path):
-        shutil.rmtree(folder_path)
-        print(f"Folder '{folder_name}' removed.")
-    os.makedirs(folder_path, exist_ok=True)
-    print(f"Folder '{folder_name}' created.")
+    comm = MPI.COMM_WORLD
+    if comm.rank == 0:
+        if os.path.exists(folder_path):
+            shutil.rmtree(folder_path)
+            print(f"Folder '{folder_name}' removed.")
+        os.makedirs(folder_path, exist_ok=True)
+        print(f"Folder '{folder_name}' created.")
+    comm.Barrier()
 
 
 def create_folder_if_not_exists(folder_name: str) -> None:
-    os.makedirs(folder_name, exist_ok=True)
-    print(f"Folder '{folder_name}' ensured.")
+    """Ensure folder exists; rank 0 creates, everyone synchronises."""
+    comm = MPI.COMM_WORLD
+    if comm.rank == 0:
+        os.makedirs(folder_name, exist_ok=True)
+        print(f"Folder '{folder_name}' ensured.")
+    comm.Barrier()
+
 
 # -----------------------------------------------------------------------------
 # Lightweight checkpointing (NumPy .npz, MPI-aware)
 # -----------------------------------------------------------------------------
+
 
 def _vec_to_array(f) -> np.ndarray:
     return f.vector().get_local()
@@ -70,26 +94,43 @@ def _array_to_vec(f, arr: np.ndarray) -> None:
 
 
 def save_state(u: Function, filename: str = "./stateBackup/state.npz") -> None:
-    np.savez_compressed(filename, u=_vec_to_array(u))
+    """Save function vector. In parallel, write one file per-rank."""
+    comm = MPI.COMM_WORLD
+    if comm.size == 1:
+        np.savez_compressed(filename, u=_vec_to_array(u))
+    else:
+        np.savez_compressed(f"{filename}.rank{comm.rank}", u=_vec_to_array(u))
+    comm.Barrier()
 
 
 def load_state(u: Function, filename: str = "./stateBackup/state.npz") -> None:
-    data = np.load(filename)
-    _array_to_vec(u, data["u"])
+    """Load function vector. In parallel, each rank reads its own slice file."""
+    comm = MPI.COMM_WORLD
+    if comm.size == 1:
+        data = np.load(filename)
+        _array_to_vec(u, data["u"])
+    else:
+        fname = f"{filename}.rank{comm.rank}"
+        data = np.load(fname)
+        _array_to_vec(u, data["u"])
+    comm.Barrier()
 
 
 # MPI-splitting: each rank stores its local vector slice
 _comm = MPI.COMM_WORLD
 
 
-
-def save_state_mpi(step: int, u: Function, name_tpl: str = "./stateBackup/state_rank{:d}.npz") -> None:
+def save_state_mpi(
+    step: int, u: Function, name_tpl: str = "./stateBackup/state_rank{:d}.npz"
+) -> None:
     local = _vec_to_array(u)
     np.savez_compressed(name_tpl.format(_comm.rank), step=step, u=local)
+    _comm.Barrier()
 
 
-
-def load_state_mpi(u: Function, name_tpl: str = "./stateBackup/state_rank{:d}.npz") -> int:
+def load_state_mpi(
+    u: Function, name_tpl: str = "./stateBackup/state_rank{:d}.npz"
+) -> int:
     fname = name_tpl.format(_comm.rank)
     if not os.path.exists(fname):
         print(f"Rank {_comm.rank}: no checkpoint; starting fresh.")
@@ -100,7 +141,9 @@ def load_state_mpi(u: Function, name_tpl: str = "./stateBackup/state_rank{:d}.np
         _array_to_vec(u, data["u"])
     # ensure all ranks share the same step
     step = _comm.bcast(step, root=0)
+    _comm.Barrier()
     return step
+
 
 # -----------------------------------------------------------------------------
 # Simple analytic initial-condition helpers
@@ -116,7 +159,7 @@ class GaussianHill(UserExpression):
     def eval(self, value, x):  # noqa: D401
         x0, L = 0.3, 0.03  # centre & width (10× smaller)
         B = 95.0 * 1.35e-12
-        value[0] = B * math.exp(-((x[1] - x0) / L) ** 2)
+        value[0] = B * math.exp(-(((x[1] - x0) / L) ** 2))
 
     def value_shape(self):
         return ()
@@ -133,52 +176,70 @@ class DeltaPulse(UserExpression):
         pO2C = 1.35e-12
         coef = 50 * pO2C / self.rl
         std = 0.01 / self.rl
-        value[0] = coef * math.exp(-((x[1] - 0.5) ** 2) / (2 * std ** 2))
+        value[0] = coef * math.exp(-((x[1] - 0.5) ** 2) / (2 * std**2))
 
     def value_shape(self):
         return ()
+
 
 # -----------------------------------------------------------------------------
 # Vertex-wise property assignment (legacy meshes)
 # -----------------------------------------------------------------------------
 
 
-
-def assign_local_property_vertexBased(mesh: Mesh, value: float, V: FunctionSpace) -> Function:
+def assign_local_property_vertexBased(
+    mesh: Mesh, value: float, V: FunctionSpace
+) -> Function:
+    """Assign scalar per-vertex property with z>0 → 0. Parallel-local safe."""
     kW = Function(V)
     coords = V.tabulate_dof_coordinates().reshape((-1, mesh.geometry().dim()))
-    arr = np.full(V.dim(), value)
-    # zero out vertices with z > 0
-    arr[coords[:, 2] > 0.0] = 0.0
-    kW.vector()[:] = arr
+    # local dof array (size equals number of local dofs)
+    arr_local = np.full(coords.shape[0], value)
+    arr_local[coords[:, 2] > 0.0] = 0.0
+    kW.vector().set_local(arr_local)
+    kW.vector().apply("insert")
     return kW
 
 
-
-def assign_local_property_vertexBased_celltags(mesh: Mesh, value: float, V: FunctionSpace, cell_tags: MeshFunction) -> Function:
+def assign_local_property_vertexBased_celltags(
+    mesh: Mesh, value: float, V: FunctionSpace, cell_tags: MeshFunction
+) -> Function:
+    """Assign property by cell tag (tag>585 → 0). Parallel-safe via ownership map."""
     kW = Function(V)
-    arr = np.full(V.dim(), value)
     dofmap = V.dofmap()
-    for cell in cells(mesh):
+    r0, r1 = dofmap.ownership_range()
+    arr_local = np.full(r1 - r0, value)
+    for cell in cells(mesh):  # iterates local cells
         if cell_tags[cell.index()] > 585:
-            arr[dofmap.cell_dofs(cell.index())] = 0.0
-    kW.vector()[:] = arr
+            g_dofs = dofmap.cell_dofs(cell.index())  # global dofs
+            for gd in g_dofs:
+                if r0 <= gd < r1:
+                    arr_local[gd - r0] = 0.0
+    kW.vector().set_local(arr_local)
+    kW.vector().apply("insert")
     return kW
 
 
+def assign_initial_condition_vertex_based(
+    mesh: Mesh, V: FunctionSpace, base_val: float, y_thresh: float = 0.3
+) -> Function:
+    """Assign piecewise-in-y initial values per local dof.
 
-def assign_initial_condition_vertex_based(mesh: Mesh, V: FunctionSpace, base_val: float, y_thresh: float = 0.3) -> Function:
+    Uses local vector sizing for MPI safety and finalizes with apply("insert").
+    """
     f = Function(V)
     coords = V.tabulate_dof_coordinates().reshape((-1, mesh.geometry().dim()))
-    arr = np.empty(V.dim())
+    # Use local dof count; tabulate_dof_coordinates returns local coords
+    arr_local = np.empty(coords.shape[0])
     for i, xyz in enumerate(coords):
         if xyz[2] > 0:
-            arr[i] = 0.9 * base_val if xyz[1] < y_thresh else 0.2 * base_val
+            arr_local[i] = 0.9 * base_val if xyz[1] < y_thresh else 0.2 * base_val
         else:
-            arr[i] = 0.6 * base_val
-    f.vector()[:] = arr
+            arr_local[i] = 0.6 * base_val
+    f.vector().set_local(arr_local)
     f.vector().apply("insert")
     return f
+
 
 # -----------------------------------------------------------------------------
 # Geometry helpers for direction vectors
@@ -216,19 +277,23 @@ def cellDirVec_DG(mesh: Mesh, vecs: np.ndarray) -> Function:
     Vdg = VectorFunctionSpace(mesh, "DG", 0)
     return project(_DirVectorExpr(vecs, degree=0), Vdg)
 
+
 # -----------------------------------------------------------------------------
 # Physiology helpers
 # -----------------------------------------------------------------------------
+
 
 def SHb(domain, CF, solCoef):
     """Hill saturation for haemoglobin (legacy UFL)."""
     P50, n = 26.8, 2.7
     pO2 = CF / Constant(solCoef)
-    return (pO2 ** n) / (P50 ** n + pO2 ** n)
+    return (pO2**n) / (P50**n + pO2**n)
+
 
 # -----------------------------------------------------------------------------
 # Minimal PETSc Krylov projection helper (legacy API)
 # -----------------------------------------------------------------------------
+
 
 def project_function_legacy(Vt: FunctionSpace, src) -> Function:
     """Cheap projection using assemble + PETScKrylovSolver (classic dolfin)."""
