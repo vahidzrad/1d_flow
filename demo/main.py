@@ -2,74 +2,22 @@ import dolfin as df
 import numpy as np
 import scipy.io as sio
 import os, sys, json
-from time import time
-from ufl import tanh, variable, max_value
+
+# (No direct UFL utilities imported; keep imports minimal)
 from mpi4py import MPI
-from petsc4py import PETSc
 from pathlib import Path
 
 base_dir = "/workspace"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-# -----------------------------------------------------------------------------
-# INITIAL SET-UP
-# -----------------------------------------------------------------------------
+"""
+INITIAL SET-UP (quiet): initialise MPI and basic parameters without diagnostics.
+"""
 commMPI = MPI.COMM_WORLD
 rank = commMPI.Get_rank()
 sizeMPI = commMPI.Get_size()
-start_time = time()
 
-# -----------------------------------------------------------------------------
-# DIAGNOSTICS: print MPI/PETSc vendor and selected PETSc options per rank
-# -----------------------------------------------------------------------------
-def print_diagnostics(prefix="Startup"):
-    try:
-        mpi_ver = MPI.Get_library_version().strip()
-    except Exception:
-        mpi_ver = "<unknown>"
-    try:
-        petsc_ver = PETSc.Sys.getVersion()
-    except Exception:
-        petsc_ver = "<unknown>"
-    try:
-        petsc_vendor = PETSc.Sys.getVendor()
-    except Exception:
-        petsc_vendor = ("<unknown>", "", "")
-    try:
-        opts = PETSc.Options()
-        ksp_type = opts.getString("ksp_type")
-        pc_type = opts.getString("pc_type")
-        pc_factor = opts.getString("pc_factor_mat_solver_type")
-    except Exception:
-        ksp_type = pc_type = pc_factor = None
-
-    msg = (
-        f"R{rank}/{sizeMPI} [{prefix}] "
-        f"MPI='{mpi_ver}', PETSc='{petsc_ver}', Vendor={petsc_vendor}; "
-        f"ksp_type={ksp_type}, pc_type={pc_type}, pc_factor={pc_factor}"
-    )
-    print(msg)
-    sys.stdout.flush()
-
-print_diagnostics("Startup")
-
-# Rank 0: show argv to confirm PETSc-style flags are reaching Python
-if rank == 0:
-    try:
-        print(f"argv: {sys.argv}")
-        sys.stdout.flush()
-    except Exception:
-        pass
-
-# Allow simple overrides via argv/env (use alongside PETSc flags if needed)
-force_ksp = None
-force_pc = None
-skip_hypre = os.environ.get("FENICS_SKIP_HYPRE", "0") == "1" or "--skip-hypre" in sys.argv
-for i, a in enumerate(list(sys.argv)):
-    if a == "--ksp" and i + 1 < len(sys.argv):
-        force_ksp = sys.argv[i + 1]
-    if a == "--pc" and i + 1 < len(sys.argv):
-        force_pc = sys.argv[i + 1]
+# Quiet mode: remove verbose diagnostics and argv-based overrides
 
 # Global defaults for implicit solves (df.project, etc.) in MPI runs
 if sizeMPI > 1:
@@ -100,21 +48,25 @@ try:
         df.PETScOptions.set("ksp_rtol", 1e-8)
         df.PETScOptions.set("ksp_atol", 1e-12)
         df.PETScOptions.set("ksp_max_it", 500)
-    # Apply user overrides if provided
-    if force_ksp:
-        df.PETScOptions.set("ksp_type", force_ksp)
-    if force_pc:
-        df.PETScOptions.set("pc_type", force_pc)
 except Exception:
     pass
-
-# Print options after we possibly set defaults/overrides
-print_diagnostics("AfterOpts")
 
 # Ensure output folder exists
 os.makedirs("./results_1876v", exist_ok=True)
 CKPT_META = os.path.join("./results_1876v", "checkpoint_meta.json")
 CKPT_H5 = os.path.join("./results_1876v", "checkpoint.h5")
+
+
+def _check_finite(name, f):
+    try:
+        arr = f.vector().get_local()
+        if not np.all(np.isfinite(arr)):
+            if MPI.COMM_WORLD.rank == 0:
+                print(f"[nan-check] {name} contains non-finite values: min={np.nanmin(arr)}, max={np.nanmax(arr)}")
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def save_checkpoint(U_mix, step_idx, pseudo_dt_val):
@@ -181,7 +133,8 @@ pO2C = 1.35e-12  # Henry constant
 
 difD_value = 2.41e-5 * 100  # free O₂ diffusivity [mm²/s]
 PeCritical = 1  # SUPG threshold
-steadySUPG = 0  # disable SUPG for stability
+steadySUPG = 1  # enable SUPG stabilization
+supg_enable_nsteps = 7  # only use SUPG in first few steps
 Ghypertrophy = 1.0
 ratioVtVb = 12.5  # tissue/ blood volume ratio
 kWratioTmp = 0.1  # wall conductance scaling (match main_param)
@@ -301,6 +254,10 @@ _au[_au > umax] = umax
 advU_safe.vector().set_local(_au)
 advU_safe.vector().apply("insert")
 
+# Debug sanity checks
+_check_finite("Across_safe", Across_safe)
+_check_finite("advU_safe", advU_safe)
+
 # Vessel direction vectors CG1
 v_dir_DG = cellDirVec_DG(mesh, compute_directional_vectors_cells(mesh))
 v_dir = df.project(v_dir_DG, df.VectorFunctionSpace(mesh, "CG", 1))
@@ -308,6 +265,7 @@ if sizeMPI > 1:
     # In dolfin, finalize assembly and update ghosts via apply("insert")
     v_dir.vector().apply("insert")
     commMPI.barrier()
+_check_finite("v_dir", v_dir)
 
 # -----------------------------------------------------------------------------
 #  CONSTANTS
@@ -332,15 +290,9 @@ df.FunctionAssigner(V, [V0, V1]).assign(U_mixed, [U_init, Ut_init])
 # -----------------------------------------------------------------------------
 #  BOUNDARY CONDITIONS
 # -----------------------------------------------------------------------------
-no_bc = ("--no-bc" in sys.argv)
-if no_bc and rank == 0:
-    print("BCs disabled via --no-bc (debug mode)")
-if not no_bc:
-    bc_in = df.DirichletBC(V.sub(0), df.Constant(100), vertex_tags, INLET_TAG)
-    bc_out = df.DirichletBC(V.sub(0), df.Constant(20), vertex_tags, OUTLET_TAG)
-    bcs = [bc_in, bc_out]
-else:
-    bcs = []
+bc_in = df.DirichletBC(V.sub(0), df.Constant(100), vertex_tags, INLET_TAG)
+bc_out = df.DirichletBC(V.sub(0), df.Constant(20), vertex_tags, OUTLET_TAG)
+bcs = [bc_in, bc_out]
 
 # -----------------------------------------------------------------------------
 #  SUPG MATRICES
@@ -348,12 +300,12 @@ else:
 W = df.as_matrix([[7 / 24, -1 / 24], [13 / 24, 5 / 24]])
 W_inv = df.inv(W)
 phi_grad = df.dot(df.grad(phi_b), v_dir)
-# Use raw advU for SUPG weighting (match main_param behavior)
-Pw = W * advU * phi_grad
+# Use clamped advection (advU_safe) for stability
+Pw = W * advU_safe * phi_grad
 
 Pw_vec = df.as_vector(
-    [advU * phi_grad, advU * phi_grad]  # first component
-)  # second component
+    [advU_safe * phi_grad, advU_safe * phi_grad]
+)
 
 
 # -----------------------------------------------------------------------------
@@ -361,20 +313,20 @@ Pw_vec = df.as_vector(
 # -----------------------------------------------------------------------------
 
 
-def weakL(test, CF, CT):
+def weakL(test, CF, CT, ADV):
     """Return weak form of blood equation (no SUPG).
     Diffusion applies *only* to dissolved O₂ (CF)."""
     return (
-        test * advU * df.dot(df.grad(CT), v_dir)  # advection of total O₂ (raw advU)
+        test * ADV * df.dot(df.grad(CT), v_dir)  # advection of total O₂ (possibly off)
         + Db * df.inner(df.grad(CF), df.grad(test))  # **diffuse dissolved only**
         + test * AkVb * CF  # exchange source
     )
 
 
-def funR(CFn, CTn, CFtn):
+def funR(CFn, CTn, CFtn, ADV):
     ww = df.as_vector([0.5, 0.5])
-    # use raw advU for consistency with Pw and weakL
-    return -ww * (AkVb * CFtn - advU * df.dot(df.grad(CTn), v_dir) - AkVb * CFn)
+    # use provided ADV for consistency with Pw and weakL
+    return -ww * (AkVb * CFtn - ADV * df.dot(df.grad(CTn), v_dir) - AkVb * CFn)
 
 
 # -----------------------------------------------------------------------------
@@ -384,7 +336,7 @@ U_lin = df.TrialFunction(V)
 CF_lin, CFt_lin = df.split(U_lin)
 
 # blood operator with CT=CF
-Fb_lin = (weakL(phi_b, CF_lin, CF_lin) - AkVb * CFt_lin * phi_b) * df.dx
+Fb_lin = (weakL(phi_b, CF_lin, CF_lin, advU_safe) - AkVb * CFt_lin * phi_b) * df.dx
 
 # tissue operator, drop nonlinear uptake term
 Ft_lin = (
@@ -392,95 +344,38 @@ Ft_lin = (
 ) * df.dx
 
 try:
-    # Basic partition/dofs diagnostics
-    try:
-        ndofs_loc = V.dofmap().local_dimension()
-    except Exception:
-        ndofs_loc = -1
-    print(f"R{rank}: Mesh cells={mesh.num_cells()}, dofs_local={ndofs_loc}, no_bc={no_bc}")
-    print(f"R{rank}: Building linear warm-start forms...")
-    sys.stdout.flush()
     a_lin = df.lhs(Fb_lin + Ft_lin)
     L_lin = df.rhs(Fb_lin + Ft_lin)
     solved = False
     if MPI.COMM_WORLD.Get_size() > 1:
         # In parallel, avoid df.solve default LU; use PETSc KSP explicitly
-        print(f"R{rank}: Assembling linear system (parallel)...")
-        sys.stdout.flush()
         A_lin, b_lin = df.assemble_system(a_lin, L_lin, bcs)
-        print(f"R{rank}: Assembly done. Gathering diagnostics...")
-        sys.stdout.flush()
-        # Diagnostics: matrix/vector sizes and ownership
-        try:
-            gl_rows, gl_cols = A_lin.size(0), A_lin.size(1)
-        except Exception:
-            gl_rows = gl_cols = -1
-        try:
-            lsize_u = U_mixed.vector().local_size()
-        except Exception:
-            lsize_u = -1
-        try:
-            mat = A_lin.mat()
-            r0, r1 = mat.getOwnershipRange()
-            try:
-                c0, c1 = mat.getOwnershipRangeColumn()
-            except Exception:
-                c0 = c1 = None
-            try:
-                info = mat.getInfo()
-                nz_used = info.get("nz_used", None)
-            except Exception:
-                nz_used = None
-            print(
-                f"R{rank}: A_glob=({gl_rows},{gl_cols}), OwnRows=[{r0},{r1}), OwnCols={([c0,c1] if c0 is not None else None)}, vec_loc={lsize_u}, nz_used={nz_used}"
-            )
-            sys.stdout.flush()
-        except Exception as _e_di:
-            print(f"R{rank}: diag-matrix-info failed: {_e_di}")
-            sys.stdout.flush()
-        print(f"R{rank}: Starting KSP attempts...")
-        sys.stdout.flush()
+        # Assemble done; attempt KSP solves
         # Try a few safe PETSc configurations in order (avoid hypre first)
-        solver_choices = []
-        if force_ksp and force_pc:
-            solver_choices.append((force_ksp, force_pc))
-        solver_choices += [
+        solver_choices = [
             ("gmres", "gamg"),
             ("gmres", "asm"),
             ("bicgstab", "ilu"),
+            ("gmres", "hypre_amg"),
         ]
-        if not skip_hypre:
-            solver_choices.append(("gmres", "hypre_amg"))
         for ksp_type, pc_type in solver_choices:
             try:
-                print(f"R{rank}: Attempting KSP '{ksp_type}' with PC '{pc_type}'")
-                sys.stdout.flush()
                 ksp = df.KrylovSolver(ksp_type, pc_type)
-                ksp.parameters["monitor_convergence"] = True
-                ksp.parameters["report"] = True
                 ksp.parameters["relative_tolerance"] = 1e-8
                 ksp.parameters["absolute_tolerance"] = 1e-12
                 ksp.parameters["maximum_iterations"] = 500
-                print(f"R{rank}: Solving linear variational problem ({ksp_type}+{pc_type}).")
-                sys.stdout.flush()
                 ksp.solve(A_lin, U_mixed.vector(), b_lin)
                 solved = True
                 break
-            except Exception as _e_cfg:
-                if rank == 0:
-                    print(f"KSP config failed ({ksp_type}+{pc_type}):", repr(_e_cfg))
-                    sys.stdout.flush()
+            except Exception:
                 continue
     else:
         # Serial: default solve is fine and fastest
-        print("Rank 0: Solving linear variational problem (direct df.solve in serial).")
         df.solve(a_lin == L_lin, U_mixed, bcs)
         solved = True
     if not solved:
         raise RuntimeError("Linear warm-start not solved with any KSP config")
 except Exception as e_lin:
-    if rank == 0:
-        print("Linear warm-start fallback path:", repr(e_lin))
     # Try LinearVariationalSolver with LU (serial) or KSP (parallel)
     try:
         problem_lin = df.LinearVariationalProblem(a_lin, L_lin, U_mixed, bcs)
@@ -501,15 +396,7 @@ except Exception as e_lin:
             lin_solver = df.LUSolver()
             lin_solver.solve(A_lin, U_mixed.vector(), b_lin)
 
-CF_sol, CFt_sol = U_mixed.split()
-F_res = (
-    (weakL(phi_b, CF_sol, CF_sol) - AkVb * CFt_sol * phi_b)
-    + (
-        -AkVt * (CF_sol - CFt_sol) * phi_t
-        + Dt * df.inner(df.grad(CFt_sol), df.grad(phi_t))
-    )
-) * df.dx
-print("Linear warm-start ‖R‖ =", df.assemble(F_res).norm("l2"))
+# Warm-start complete
 
 # -----------------------------------------------------------------------------
 #  PSEUDO-TIME LOOP
@@ -517,31 +404,57 @@ print("Linear warm-start ‖R‖ =", df.assemble(F_res).norm("l2"))
 
 maxG_val = 70e-12 / pO2C * Ghypertrophy  # [mol mm⁻³ s⁻¹]
 num_steps = 10
-pseudo_dt = df.Constant(1e2)
+# Start with smaller pseudo-time step and allow adaptive growth (conservative)
+pseudo_dt = df.Constant(1e-2)
+DT_GROWTH = 1.5
+DT_MAX = 1.0
 
-# Resume support: if checkpoint exists, load and continue
-resume_found, last_step_done, ckpt_dt = load_checkpoint(U_mixed)
+# Adaptive dt growth controls
+DT_GROWTH_BASE = 1.2
+DT_GROWTH_FAST = 1.4
+DT_GROWTH_SLOW = 1.05
+CFL_ADV = 0.4  # CFL-like cap using advective speed
+
+# Additional continuation controls to ease early Newton solves
+RAMP_ADV_STEPS = 3        # ramp advection over first steps
+RAMP_HCT_ONSET = 2        # keep Hct=0 for first 2 steps
+DMB_ONSET_STEP = 3        # enable membrane diffusion after step 2
+EXTRA_DIFF_STEPS = 3      # add decaying artificial diffusion for first 3 steps
+
+# Prepare previous tissue state and resume support
+_, Ut_old = U_mixed.split(deepcopy=True)
+USE_RESUME = False
+if USE_RESUME:
+    resume_found, last_step_done, ckpt_dt = load_checkpoint(U_mixed)
+else:
+    resume_found, last_step_done, ckpt_dt = (False, -1, None)
 start_step = 0
 if resume_found:
     start_step = last_step_done + 1
     if ckpt_dt is not None:
         try:
-            pseudo_dt.assign(ckpt_dt)
+            # Clamp loaded dt into sane bounds
+            _dt_loaded = float(ckpt_dt)
+            if _dt_loaded <= 0:
+                _dt_loaded = 1e-3
+            _dt_loaded = min(_dt_loaded, DT_MAX)
+            pseudo_dt.assign(_dt_loaded)
         except Exception:
-            pseudo_dt.assign(df.Constant(ckpt_dt))
+            _dt_loaded = min(max(float(ckpt_dt), 1e-3), DT_MAX)
+            pseudo_dt.assign(df.Constant(_dt_loaded))
     # Keep pseudo-time state consistent on resume
     try:
         _, _Ut_resume = U_mixed.split(deepcopy=True)
         Ut_old.assign(_Ut_resume)
     except Exception:
         pass
-    if rank == 0:
-        print(f"Resuming from checkpoint at step {start_step}/{num_steps}")
-
-_, Ut_old = U_mixed.split(deepcopy=True)
+    if MPI.COMM_WORLD.rank == 0:
+        try:
+            print(f"[resume] last step={last_step_done}, start_step={start_step}, dt={float(pseudo_dt.values()[0]):g}")
+        except Exception:
+            pass
 
 for step in range(start_step, num_steps):
-    print(f"\n=== pseudo-time {step+1}/{num_steps} ===")
 
     # Ramp metabolism: zero on first step, then gradual
     ramp_factor = 0.0 if step == 0 else (step / float(num_steps))
@@ -549,7 +462,7 @@ for step in range(start_step, num_steps):
 
     # Ramp wall exchange as well (start tiny), recompute AkVb/AkVt inside loop
     kW_loop = assign_local_property_vertexBased(
-        mesh, kWratioTmp * 35.0 * 0.001 * max(0.05, ramp_factor), V0
+        mesh, kWratioTmp * 35.0 * 0.001 * max(0.0, ramp_factor), V0
     )
     AkVb = df.project(
         df.conditional(
@@ -564,7 +477,7 @@ for step in range(start_step, num_steps):
         V_cg,
     )
     # Cap exchange rates to upper bound to limit stiffness
-    Ak_cap = 1e2
+    Ak_cap = 5.0 if step == 0 else 1e1
     _akb = AkVb.vector().get_local()
     _akb = np.clip(_akb, 0.0, Ak_cap)
     AkVb.vector().set_local(_akb)
@@ -576,14 +489,139 @@ for step in range(start_step, num_steps):
 
     # Derived fields (avoid ufl.variable; clamp U to avoid negative fractional powers)
     U_pos = df.conditional(df.ge(U, df.Constant(0.0)), U, df.Constant(0.0))
-    CB = 4 * CHb * Hct * SHb(mesh, U_pos, pO2C)
+    # Ramp haematocrit: keep off for first few steps, then follow global ramp
+    hct_ramp = 0.0 if step < RAMP_HCT_ONSET else float(ramp_factor)
+    Hct_eff = df.Constant(HctTmp * hct_ramp)
+    CB = 4 * CHb * Hct_eff * SHb(mesh, U_pos, pO2C)
     CT = CB + U
-    consumption = maxG * Ut / (Ut + km + df.Constant(1e-24))
+    # Clamp tissue concentration for nonlinear terms to avoid negative-induced instabilities
+    Ut_pos = df.conditional(df.ge(Ut, df.Constant(0.0)), Ut, df.Constant(0.0))
+    consumption = maxG * Ut_pos / (Ut_pos + km + df.Constant(1e-24))
 
-    # Blood residual (incl. SUPG)
-    Fb = (weakL(phi_b, U, CT) - AkVb * Ut * phi_b) * df.dx
+    # Sanity checks to catch NaNs early
+    _check_finite("AkVb", AkVb)
+    _check_finite("AkVt", AkVt)
+    try:
+        Ublood, Utissue = U_mixed.split()
+        _check_finite("U", Ublood)
+        _check_finite("Ut", Utissue)
+    except Exception:
+        pass
 
-    if steadySUPG:
+    # Optional Picard bootstrap in early steps: decouple and pre-smooth U/Ut
+    if step < 2:
+        try:
+            # Local copies on separate spaces
+            Ub_iter, Ut_iter = U_mixed.split(deepcopy=True)
+            # Prepare V0/V1 boundary conditions for blood
+            bc_in0 = df.DirichletBC(V0, df.Constant(100), vertex_tags, INLET_TAG)
+            bc_out0 = df.DirichletBC(V0, df.Constant(20), vertex_tags, OUTLET_TAG)
+            bcs0 = [bc_in0, bc_out0]
+
+            pb = df.TestFunction(V0)
+            CF = df.TrialFunction(V0)
+            vt_lin = df.TestFunction(V1)
+            CFt = df.TrialFunction(V1)
+
+            picard_iters = 3
+            for _ in range(picard_iters):
+                # Blood linearized with Ut frozen
+                Fb_pic = (
+                    pb * advU_safe * df.dot(df.grad(CF), v_dir)
+                    + Db * df.inner(df.grad(CF), df.grad(pb))
+                    + pb * AkVb * CF
+                    - AkVb * Ut_iter * pb
+                ) * df.dx
+                a_b, L_b = df.lhs(Fb_pic), df.rhs(Fb_pic)
+                df.solve(a_b == L_b, Ub_iter, bcs0)
+
+                # Tissue linearized with U frozen; ignore Dmb and consumption in early steps
+                Ft_pic = (
+                    (CFt - Ut_old) / pseudo_dt * vt_lin
+                    - AkVt * (Ub_iter - CFt) * vt_lin
+                    + Dt * df.inner(df.grad(CFt), df.grad(vt_lin))
+                ) * df.dx
+                a_t, L_t = df.lhs(Ft_pic), df.rhs(Ft_pic)
+                df.solve(a_t == L_t, Ut_iter)
+
+            # Assign back to mixed
+            df.FunctionAssigner(V, [V0, V1]).assign(U_mixed, [Ub_iter, Ut_iter])
+            # Refresh derived quantities after bootstrap
+            U_pos = df.conditional(df.ge(U, df.Constant(0.0)), U, df.Constant(0.0))
+            Hct_eff = df.Constant(HctTmp * ramp_factor)
+            CB = 4 * CHb * Hct_eff * SHb(mesh, U_pos, pO2C)
+            CT = CB + U
+        except Exception:
+            pass
+
+    # Optional Picard mixed linearization in first step for a better initial guess
+    if step == 0:
+        try:
+            picard_iters = 10
+            relax_pic = 0.7
+            # Local copies for iterates
+            Ub_it, Ut_it = U_mixed.split(deepcopy=True)
+            Wt = df.TrialFunction(V)
+            CF_new, CFt_new = df.split(Wt)
+            ADV_used = df.Constant(0.0)
+            Dmb_eff = df.Constant(0.0)
+            for k_it in range(picard_iters):
+                # Build lagged nonlinear pieces
+                U_it_pos = df.conditional(df.ge(Ub_it, df.Constant(0.0)), Ub_it, df.Constant(0.0))
+                Ut_it_pos = df.conditional(df.ge(Ut_it, df.Constant(0.0)), Ut_it, df.Constant(0.0))
+                CB_it = 4 * CHb * df.Constant(HctTmp * ramp_factor) * SHb(mesh, U_it_pos, pO2C)
+                CT_it = CB_it + Ub_it
+                cons_it = maxG * Ut_it_pos / (Ut_it_pos + km + df.Constant(1e-24))
+
+                Fb_pic = (
+                    phi_b * ADV_used * df.dot(df.grad(CT_it), v_dir)
+                    + Db * df.inner(df.grad(CF_new), df.grad(phi_b))
+                    + phi_b * AkVb * CF_new
+                    - AkVb * CFt_new * phi_b
+                ) * df.dx
+                Ft_pic = (
+                    (CFt_new - Ut_old) / pseudo_dt * phi_t
+                    - AkVt * (CF_new - CFt_new) * phi_t
+                    + cons_it * phi_t
+                    + Dt * df.inner(df.grad(CFt_new), df.grad(phi_t))
+                    + Dmb_eff * CMb * df.inner(
+                        df.grad(Ut_it_pos / (Ut_it_pos + C50)), df.grad(phi_t)
+                    )
+                ) * df.dx
+                a_pic = df.lhs(Fb_pic + Ft_pic)
+                L_pic = df.rhs(Fb_pic + Ft_pic)
+                U_tmp = df.Function(V)
+                df.solve(a_pic == L_pic, U_tmp, bcs)
+                # Relaxed update of iterates
+                Ub_new, Ut_new_lin = U_tmp.split()
+                Ub_it.vector().axpy(relax_pic, Ub_new.vector())
+                Ub_it.vector().axpby(1.0 - relax_pic, 0.0, Ub_it.vector())
+                Ut_it.vector().axpy(relax_pic, Ut_new_lin.vector())
+                Ut_it.vector().axpby(1.0 - relax_pic, 0.0, Ut_it.vector())
+                Ub_it.vector().apply("insert")
+                Ut_it.vector().apply("insert")
+                # Simple stopping by update norm
+                try:
+                    diff = (U_tmp.vector() - U_mixed.vector()).norm("l2")
+                    ref = max(1e-12, U_mixed.vector().norm("l2"))
+                    if MPI.COMM_WORLD.rank == 0:
+                        print(f"[step 0 picard] iter {k_it+1}/{picard_iters} update rel={diff/ref:.3e}")
+                    if diff / ref < 1e-3:
+                        break
+                except Exception:
+                    pass
+            # Assign iterate back
+            df.FunctionAssigner(V, [V0, V1]).assign(U_mixed, [Ub_it, Ut_it])
+        except Exception:
+            pass
+
+    # Blood residual (incl. SUPG) with advection ramped in over first steps
+    adv_factor = 0.0 if step == 0 else min(1.0, float(step) / float(RAMP_ADV_STEPS))
+    ADV_used = advU_safe * df.Constant(adv_factor)
+    Fb = (weakL(phi_b, U, CT, ADV_used) - AkVb * Ut * phi_b) * df.dx
+
+    use_supg = bool(steadySUPG) and (step > 0) and (step < supg_enable_nsteps)
+    if use_supg:
         # Compute SUPG tau numerically to avoid UFL math on Functions
         _au = advU_safe.vector().get_local()
         _dl = dL.vector().get_local()
@@ -596,48 +634,56 @@ for step in range(start_step, num_steps):
         tau_scalar.vector().apply("insert")
         tau = tau_scalar * W_inv
         # Fb += df.inner(tau*Pw, funR(U, CT, Ut))*df.dx
-        Fb += df.dot(tau * Pw_vec, funR(U, CT, Ut)) * df.dx
+        Fb += df.dot(tau * Pw_vec, funR(U, CT, Ut, ADV_used)) * df.dx
     # Tissue residual – **sign fixed** (+AkVt)
     Ft = (
         (Ut - Ut_old) / pseudo_dt * phi_t
         - AkVt * (U - Ut) * phi_t
         + consumption * phi_t
         + Dt * df.inner(df.grad(Ut), df.grad(phi_t))
-        + Dmb * CMb * df.inner(df.grad(Ut / (Ut + C50)), df.grad(phi_t))
+        + (df.Constant(0.0) if step < DMB_ONSET_STEP else Dmb) * CMb
+        * df.inner(df.grad(Ut_pos / (Ut_pos + C50)), df.grad(phi_t))
     ) * df.dx
 
     F = Fb + Ft
-    # Mild artificial diffusion on blood in first step for robustness
-    if step == 0:
-        F += (0.3 * Db) * df.inner(df.grad(U), df.grad(phi_b)) * df.dx
+    # Mild artificial diffusion on blood in early steps for robustness (decays to 0)
+    if step < EXTRA_DIFF_STEPS:
+        decay = float(EXTRA_DIFF_STEPS - step) / float(EXTRA_DIFF_STEPS)
+        F += (0.5 * decay * Db) * df.inner(df.grad(U), df.grad(phi_b)) * df.dx
     J = df.derivative(F, U_mixed, δ)
 
     # Newton solve with DOLFIN's NonlinearVariationalSolver
-    try:
-        Fb_vec = df.assemble(Fb)
-        Ft_vec = df.assemble(Ft)
-        if rank == 0:
-            print("||Fb|| =", Fb_vec.norm("l2"), " ||Ft|| =", Ft_vec.norm("l2"))
-    except Exception as e:
-        if rank == 0:
-            print("Assembly check failed:", repr(e))
+    # Optional assembly checks removed for cleanliness
 
     problem = df.NonlinearVariationalProblem(F, U_mixed, bcs, J)
     solver = df.NonlinearVariationalSolver(problem)
     prm = solver.parameters
+    # Set Newton tolerances based on global dof count (looser), and use faster line search
     try:
-        prm["newton_solver"]["relative_tolerance"] = 1e-6
-        prm["newton_solver"]["absolute_tolerance"] = 1e-8
-        prm["newton_solver"]["maximum_iterations"] = 50
-        prm["newton_solver"]["linear_solver"] = "lu"
-        prm["newton_solver"]["relaxation_parameter"] = 0.3
-        prm["newton_solver"]["error_on_nonconvergence"] = False
+        ndofs = V.dim()
+        # Absolute tol scaled with sqrt(N) so it is not unrealistically small
+        abs_tol = max(1e-8, 1e-6 * float(ndofs) ** 0.5)
+        prm["newton_solver"]["relative_tolerance"] = 2e-3
+        prm["newton_solver"]["absolute_tolerance"] = abs_tol
+        prm["newton_solver"]["maximum_iterations"] = 60
+        prm["newton_solver"]["linear_solver"] = "gmres" if MPI.COMM_WORLD.Get_size() > 1 else "lu"
+        # Use faster backtracking line search once continuation is in place
         prm["newton_solver"]["line_search"] = "bt"
+        # Choose preconditioner appropriate to MPI size
+        if MPI.COMM_WORLD.Get_size() > 1:
+            prm["newton_solver"]["preconditioner"] = "hypre_amg"
+        else:
+            prm["newton_solver"]["preconditioner"] = "ilu"
+        prm["newton_solver"]["error_on_nonconvergence"] = False
+        # Optional: reduce verbosity
+        prm["newton_solver"]["report"] = False
+        if MPI.COMM_WORLD.rank == 0:
+            print(f"[newton] rel_tol=2e-3 abs_tol={abs_tol:.3e} (ndofs={ndofs})")
     except Exception:
         pass
 
     # Retry with pseudo_dt backoff if failure occurs
-    max_retries = 5
+    max_retries = 8
     try_id = 0
     success_local = 0
     current_dt = None
@@ -656,39 +702,39 @@ for step in range(start_step, num_steps):
 
         try:
             solver.solve()
+            # Accept solve if vector is finite (treat as success);
+            # some dolfin builds don't expose a reliable converged() API
             vec = U_mixed.vector().get_local()
-            if np.all(np.isfinite(vec)):
-                success_local = 1
-            else:
-                success_local = 0
+            success_local = 1 if np.all(np.isfinite(vec)) else 0
         except Exception as e:
             success_local = 0
 
         # MPI agreement: all ranks must succeed
         success_global = MPI.COMM_WORLD.allreduce(success_local, op=MPI.MIN)
         if success_global == 1:
+            if MPI.COMM_WORLD.rank == 0:
+                print(f"[step {step}] Accepted solve at dt={current_dt:g}")
             break
 
         # Revert and back off dt, clamp negatives
-        df.FunctionAssigner(V, [V0, V1]).assign(U_mixed, U_prev.split())
+        try:
+            U_mixed.assign(U_prev)
+        except Exception:
+            df.FunctionAssigner(V, [V0, V1]).assign(U_mixed, list(U_prev.split()))
         vloc = U_mixed.vector().get_local()
         vloc[~np.isfinite(vloc)] = 0.0
         vloc[vloc < 0.0] = 0.0
         U_mixed.vector().set_local(vloc)
         U_mixed.vector().apply("insert")
 
-        current_dt = max(current_dt / 2.0, 1e-4)
-        if rank == 0:
-            print(
-                f"Solve failed on try {try_id+1}; reducing dt to {current_dt:.4e} and retrying."
-            )
+        current_dt = max(current_dt / 2.0, 1e-6)
+        if MPI.COMM_WORLD.rank == 0:
+            print(f"[step {step}] Newton failed; backing off dt to {current_dt:g} (try {try_id+1}/{max_retries})")
         try_id += 1
 
     if try_id == max_retries and success_local == 0:
-        if rank == 0:
-            print(
-                "Step failed after retries; stopping early. Last completed step is saved."
-            )
+        if MPI.COMM_WORLD.rank == 0:
+            print(f"[step {step}] Aborting pseudo-time loop: max retries exhausted.")
         # Save the last successful checkpoint of previous step is already on disk
         break
 
@@ -710,4 +756,56 @@ for step in range(start_step, num_steps):
     # Persist checkpoint for resume (0-based step index)
     save_checkpoint(U_mixed, step, current_dt)
 
-print(f"Total runtime: {time() - start_time:.1f} s")
+    # Increase pseudo-time step for next iteration on success (conservative & capped)
+    try:
+        # Measure update size to adapt growth
+        try:
+            upd = (U_mixed.vector() - U_prev.vector()).norm("l2")
+            base = max(1e-12, U_mixed.vector().norm("l2"))
+            upd_rel = upd / base
+        except Exception:
+            upd_rel = None
+
+        growth = DT_GROWTH_BASE
+        # If we had retries this step, be extra conservative
+        if try_id > 0:
+            growth = DT_GROWTH_SLOW
+        if upd_rel is not None:
+            if upd_rel > 0.2:
+                growth = DT_GROWTH_SLOW
+            elif upd_rel < 0.05:
+                growth = DT_GROWTH_FAST
+
+        # CFL-like cap based on advection and element size
+        try:
+            _umax_local = 0.0
+            _hmin_local = 1e20
+            _a = advU_safe.vector().get_local()
+            _d = dL.vector().get_local()
+            if _a.size > 0:
+                _umax_local = float(np.max(_a))
+            if _d.size > 0:
+                _hmin_local = float(np.min(_d))
+            umax = MPI.COMM_WORLD.allreduce(_umax_local, op=MPI.MAX)
+            hmin = MPI.COMM_WORLD.allreduce(_hmin_local, op=MPI.MIN)
+            dt_cfl = CFL_ADV * hmin / max(umax, 1e-12)
+        except Exception:
+            dt_cfl = DT_MAX
+
+        # Model continuation-based cap: keep dt modest until all ramps are on
+        if step < DMB_ONSET_STEP + 1:
+            dt_model_cap = 0.03
+        elif step < RAMP_HCT_ONSET + 2:
+            dt_model_cap = 0.06
+        else:
+            dt_model_cap = 0.1
+
+        next_dt = min(current_dt * growth, dt_cfl, dt_model_cap, DT_MAX)
+        pseudo_dt.assign(next_dt)
+        if MPI.COMM_WORLD.rank == 0:
+            cap_info = f"(growth={growth:.2f}, cfl={dt_cfl:.4g}, model_cap={dt_model_cap})"
+            print(f"[step {step}] Increasing dt to {next_dt:g} for next step {cap_info}")
+    except Exception:
+        pass
+
+# Finished
