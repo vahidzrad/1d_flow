@@ -2,6 +2,7 @@ import dolfin as df
 import numpy as np
 import scipy.io as sio
 import os, sys, json
+from datetime import datetime
 
 # (No direct UFL utilities imported; keep imports minimal)
 from mpi4py import MPI
@@ -51,10 +52,58 @@ try:
 except Exception:
     pass
 
-# Ensure output folder exists
-os.makedirs("./results_1876v", exist_ok=True)
-CKPT_META = os.path.join("./results_1876v", "checkpoint_meta.json")
-CKPT_H5 = os.path.join("./results_1876v", "checkpoint.h5")
+# Results directory handling: create a unique folder per run to avoid overwrite
+def _init_results_dir(base_name: str = "results_1876v") -> str:
+    """Create a unique results directory for this run.
+
+    Rank 0 picks a timestamped name (optionally suffixed by env RESULTS_SUFFIX),
+    ensures creation, then broadcasts the path to all ranks.
+    """
+    comm = MPI.COMM_WORLD
+    run_dir = None
+    if comm.rank == 0:
+        # Policy:
+        # - If base_name is exactly 'results_1876v': keep that folder name exactly
+        #   (create if missing), do NOT append timestamp or index.
+        # - Else (e.g., results_<suffix>): ensure uniqueness by appending _NN if exists.
+        if base_name == "results_1876v":
+            candidate = Path(".") / base_name
+            candidate.mkdir(parents=True, exist_ok=True)
+        else:
+            base = base_name
+            candidate = Path(".") / base
+            idx = 0
+            while candidate.exists():
+                idx += 1
+                candidate = Path(".") / f"{base}_{idx:02d}"
+            candidate.mkdir(parents=True, exist_ok=False)
+        run_dir = str(candidate)
+        print(f"Results directory: {run_dir}")
+    # Share the chosen directory with all ranks
+    run_dir = comm.bcast(run_dir, root=0)
+    # Non-root ranks ensure it exists (NOP if already created)
+    if comm.rank != 0:
+        os.makedirs(run_dir, exist_ok=True)
+    comm.Barrier()
+    return run_dir
+
+
+# Lightweight CLI/env config
+RESULTS_SUFFIX = os.environ.get("RESULTS_SUFFIX", "").strip()
+OUTPUT_FORMAT = os.environ.get("OUTPUT_FORMAT", "both").strip().lower()
+for arg in sys.argv[1:]:
+    if arg.startswith("--results-suffix="):
+        RESULTS_SUFFIX = arg.split("=", 1)[1].strip()
+    elif arg.startswith("--output-format="):
+        OUTPUT_FORMAT = arg.split("=", 1)[1].strip().lower()
+
+# Normalise output selection
+if OUTPUT_FORMAT not in ("pvd", "xdmf", "both"):
+    OUTPUT_FORMAT = "both"
+
+RESULTS_DIR = _init_results_dir("results_1876v" if not RESULTS_SUFFIX else f"results_{RESULTS_SUFFIX}")
+CKPT_META = os.path.join(RESULTS_DIR, "checkpoint_meta.json")
+CKPT_H5 = os.path.join(RESULTS_DIR, "checkpoint.h5")
 
 
 def _check_finite(name, f):
@@ -197,10 +246,20 @@ V_dg = df.FunctionSpace(mesh, "DG", 0)
 Qcell = df.Function(V_dg)
 Rcell = df.Function(V_dg)
 
-cell_ids = np.array([c.index() for c in df.cells(mesh)], dtype=int)
-cell_vids = np.array([cell_tags[c] for c in df.cells(mesh)], dtype=int) - 1
-Qcell.vector().set_local(Qvessel[cell_vids])
-Rcell.vector().set_local(Rvessel[cell_vids])
+# MPI-robust fill of DG0 fields from cell tags (owned dofs only)
+dm = V_dg.dofmap()
+r0, r1 = dm.ownership_range()
+loc_Q = np.zeros(r1 - r0, dtype=float)
+loc_R = np.zeros(r1 - r0, dtype=float)
+for cell in df.cells(mesh):
+    tag = int(cell_tags[cell]) - 1
+    tag = 0 if tag < 0 else tag
+    gd = dm.cell_dofs(cell.index())[0]
+    if r0 <= gd < r1:
+        loc_Q[gd - r0] = float(Qvessel[tag])
+        loc_R[gd - r0] = float(Rvessel[tag])
+Qcell.vector().set_local(loc_Q)
+Rcell.vector().set_local(loc_R)
 Qcell.vector().apply("insert")
 Rcell.vector().apply("insert")
 
@@ -243,9 +302,10 @@ advU = df.project(Qcell / Across_safe, V_cg)
 advU_safe = df.Function(V_cg)
 _au = advU.vector().get_local()
 _au[_au < df.DOLFIN_EPS] = df.DOLFIN_EPS
-# Upper cap to limit extreme velocities (reduce stiffness)
+# Upper cap to limit extreme velocities (reduce stiffness) using a global 95th percentile
 try:
-    umax = np.percentile(_au, 95)
+    u95_loc = float(np.percentile(_au, 95)) if _au.size > 0 else 0.0
+    umax = MPI.COMM_WORLD.allreduce(u95_loc, op=MPI.MAX)
     if not np.isfinite(umax) or umax <= df.DOLFIN_EPS:
         umax = 5.0
 except Exception:
@@ -258,8 +318,10 @@ advU_safe.vector().apply("insert")
 _check_finite("Across_safe", Across_safe)
 _check_finite("advU_safe", advU_safe)
 
-# Vessel direction vectors CG1
-v_dir_DG = cellDirVec_DG(mesh, compute_directional_vectors_cells(mesh))
+# Vessel direction vectors (MPI-robust build per cell, then project to CG1)
+from auxiliaryFunctions_dolfin import cell_tangent_dg_safe
+
+v_dir_DG = cell_tangent_dg_safe(mesh)
 v_dir = df.project(v_dir_DG, df.VectorFunctionSpace(mesh, "CG", 1))
 if sizeMPI > 1:
     # In dolfin, finalize assembly and update ghosts via apply("insert")
@@ -403,7 +465,9 @@ except Exception as e_lin:
 # -----------------------------------------------------------------------------
 
 maxG_val = 70e-12 / pO2C * Ghypertrophy  # [mol mm⁻³ s⁻¹]
-num_steps = 10
+num_steps = 10000
+# Output control: write XDMF results every N steps
+SAVE_EVERY_N_STEPS = 50
 # Start with smaller pseudo-time step and allow adaptive growth (conservative)
 pseudo_dt = df.Constant(1e-2)
 DT_GROWTH = 1.5
@@ -415,11 +479,52 @@ DT_GROWTH_FAST = 1.4
 DT_GROWTH_SLOW = 1.05
 CFL_ADV = 0.4  # CFL-like cap using advective speed
 
+# Optional early termination on steady update
+STEADY_STOP_ENABLE = True
+STEADY_TOL = 1e-4          # relative update threshold
+STEADY_WINDOW = 2          # consecutive steps within tol
+MIN_STEPS_BEFORE_STEADY = 3  # wait a few steps before checking
+steady_hits = 0
+
+# Output format selection and writer prep
+want_pvd = OUTPUT_FORMAT in ("pvd", "both")
+want_xdmf = OUTPUT_FORMAT in ("xdmf", "both")
+
+# Prepare PVD time-series writers
+try:
+    vtkfile_b = df.File(os.path.join(RESULTS_DIR, "CFb_timeseries.pvd")) if want_pvd else None
+    vtkfile_t = df.File(os.path.join(RESULTS_DIR, "CFt_timeseries.pvd")) if want_pvd else None
+except Exception:
+    vtkfile_b = None
+    vtkfile_t = None
+
+# Prepare XDMF time-series writers
+try:
+    xdmf_b = (
+        df.XDMFFile(commMPI, os.path.join(RESULTS_DIR, "CFb_timeseries.xdmf")) if want_xdmf else None
+    )
+    xdmf_t = (
+        df.XDMFFile(commMPI, os.path.join(RESULTS_DIR, "CFt_timeseries.xdmf")) if want_xdmf else None
+    )
+    if xdmf_b is not None:
+        xdmf_b.parameters["flush_output"] = True
+        xdmf_b.parameters["functions_share_mesh"] = True
+    if xdmf_t is not None:
+        xdmf_t.parameters["flush_output"] = True
+        xdmf_t.parameters["functions_share_mesh"] = True
+except Exception:
+    xdmf_b = None
+    xdmf_t = None
+
+# Accumulated pseudo-time for time-series outputs
+t_accum = 0.0
+
 # Additional continuation controls to ease early Newton solves
-RAMP_ADV_STEPS = 3        # ramp advection over first steps
-RAMP_HCT_ONSET = 2        # keep Hct=0 for first 2 steps
-DMB_ONSET_STEP = 3        # enable membrane diffusion after step 2
-EXTRA_DIFF_STEPS = 3      # add decaying artificial diffusion for first 3 steps
+# Ramp controls (more conservative in MPI)
+RAMP_ADV_STEPS = 8 if sizeMPI > 1 else 3        # ramp advection over first steps
+RAMP_HCT_ONSET = 4 if sizeMPI > 1 else 2        # keep Hct=0 longer in MPI
+DMB_ONSET_STEP = 5 if sizeMPI > 1 else 3        # enable membrane diffusion later in MPI
+EXTRA_DIFF_STEPS = 5 if sizeMPI > 1 else 3      # add decaying artificial diffusion for first steps
 
 # Prepare previous tissue state and resume support
 _, Ut_old = U_mixed.split(deepcopy=True)
@@ -620,6 +725,7 @@ for step in range(start_step, num_steps):
     ADV_used = advU_safe * df.Constant(adv_factor)
     Fb = (weakL(phi_b, U, CT, ADV_used) - AkVb * Ut * phi_b) * df.dx
 
+    # Use SUPG during early steps to stabilize advection
     use_supg = bool(steadySUPG) and (step > 0) and (step < supg_enable_nsteps)
     if use_supg:
         # Compute SUPG tau numerically to avoid UFL math on Functions
@@ -670,9 +776,8 @@ for step in range(start_step, num_steps):
         # Use faster backtracking line search once continuation is in place
         prm["newton_solver"]["line_search"] = "bt"
         # Choose preconditioner appropriate to MPI size
-        if MPI.COMM_WORLD.Get_size() > 1:
-            prm["newton_solver"]["preconditioner"] = "hypre_amg"
-        else:
+        # In MPI, rely on PETScOptions (pc_type=gamg set above); do not force hypre
+        if MPI.COMM_WORLD.Get_size() == 1:
             prm["newton_solver"]["preconditioner"] = "ilu"
         prm["newton_solver"]["error_on_nonconvergence"] = False
         # Optional: reduce verbosity
@@ -742,16 +847,31 @@ for step in range(start_step, num_steps):
     _, Ut_new = U_mixed.split(deepcopy=True)
     Ut_old.assign(Ut_new)
 
-    # Write results and checkpoint
+    # Advance accumulated pseudo-time by accepted dt for this step
+    try:
+        t_accum += float(current_dt)
+    except Exception:
+        pass
+
+    # Write results (every SAVE_EVERY_N_STEPS) and checkpoint
     sid = step + 1
-    with df.XDMFFile(commMPI, f"./results_1876v/CFb_step_{sid:02d}.xdmf") as xb:
-        Ublood, _ = U_mixed.split()
+    if (sid % SAVE_EVERY_N_STEPS) == 0:
+        Ublood, Utissue = U_mixed.split()
         Ublood.rename("CFb", "")
-        xb.write(Ublood)
-    with df.XDMFFile(commMPI, f"./results_1876v/CFt_step_{sid:02d}.xdmf") as xt:
-        _, Utissue = U_mixed.split()
         Utissue.rename("CFt", "")
-        xt.write(Utissue)
+        # Append to requested outputs
+        try:
+            if want_pvd and (vtkfile_b is not None) and (vtkfile_t is not None):
+                vtkfile_b << (Ublood, t_accum)
+                vtkfile_t << (Utissue, t_accum)
+        except Exception:
+            pass
+        try:
+            if want_xdmf and (xdmf_b is not None) and (xdmf_t is not None):
+                xdmf_b.write(Ublood, t_accum)
+                xdmf_t.write(Utissue, t_accum)
+        except Exception:
+            pass
 
     # Persist checkpoint for resume (0-based step index)
     save_checkpoint(U_mixed, step, current_dt)
@@ -778,17 +898,19 @@ for step in range(start_step, num_steps):
 
         # CFL-like cap based on advection and element size
         try:
-            _umax_local = 0.0
-            _hmin_local = 1e20
             _a = advU_safe.vector().get_local()
             _d = dL.vector().get_local()
             if _a.size > 0:
-                _umax_local = float(np.max(_a))
+                u95_loc = float(np.percentile(_a, 95))
+            else:
+                u95_loc = 0.0
             if _d.size > 0:
-                _hmin_local = float(np.min(_d))
-            umax = MPI.COMM_WORLD.allreduce(_umax_local, op=MPI.MAX)
-            hmin = MPI.COMM_WORLD.allreduce(_hmin_local, op=MPI.MIN)
-            dt_cfl = CFL_ADV * hmin / max(umax, 1e-12)
+                h5_loc = float(np.percentile(_d, 5))
+            else:
+                h5_loc = 1e20
+            u95 = MPI.COMM_WORLD.allreduce(u95_loc, op=MPI.MAX)
+            h5 = MPI.COMM_WORLD.allreduce(h5_loc, op=MPI.MIN)
+            dt_cfl = CFL_ADV * h5 / max(u95, 1e-12)
         except Exception:
             dt_cfl = DT_MAX
 
@@ -800,12 +922,44 @@ for step in range(start_step, num_steps):
         else:
             dt_model_cap = 0.1
 
-        next_dt = min(current_dt * growth, dt_cfl, dt_model_cap, DT_MAX)
+        dt_grown = current_dt * growth
+        # Do not shrink dt on a successful step; only cap growth
+        next_dt = min(dt_grown, max(current_dt, dt_cfl), max(current_dt, dt_model_cap), DT_MAX)
         pseudo_dt.assign(next_dt)
         if MPI.COMM_WORLD.rank == 0:
-            cap_info = f"(growth={growth:.2f}, cfl={dt_cfl:.4g}, model_cap={dt_model_cap})"
+            cap_info = f"(growth={growth:.2f}, cfl_q={dt_cfl:.4g}, model_cap={dt_model_cap})"
             print(f"[step {step}] Increasing dt to {next_dt:g} for next step {cap_info}")
     except Exception:
         pass
 
+    # Optional steady-state early exit
+    if STEADY_STOP_ENABLE and (step + 1) >= MIN_STEPS_BEFORE_STEADY:
+        try:
+            upd = (U_mixed.vector() - U_prev.vector()).norm("l2")
+            base = max(1e-12, U_mixed.vector().norm("l2"))
+            rel_upd = upd / base
+            if MPI.COMM_WORLD.rank == 0:
+                print(f"[steady-check] rel_update={rel_upd:.3e} tol={STEADY_TOL:g} window={STEADY_WINDOW}")
+            if rel_upd < STEADY_TOL:
+                steady_hits += 1
+            else:
+                steady_hits = 0
+            if steady_hits >= STEADY_WINDOW:
+                if MPI.COMM_WORLD.rank == 0:
+                    print(f"[steady] Reached steady tolerance {STEADY_TOL:g} for {STEADY_WINDOW} steps. Finishing.")
+                break
+        except Exception:
+            pass
+
 # Finished
+try:
+    if 'vtkfile_b' in locals() and vtkfile_b is not None:
+        vtkfile_b.close()
+    if 'vtkfile_t' in locals() and vtkfile_t is not None:
+        vtkfile_t.close()
+    if 'xdmf_b' in locals() and xdmf_b is not None:
+        xdmf_b.close()
+    if 'xdmf_t' in locals() and xdmf_t is not None:
+        xdmf_t.close()
+except Exception:
+    pass

@@ -310,5 +310,43 @@ def project_function_legacy(Vt: FunctionSpace, src) -> Function:
 
 
 # -----------------------------------------------------------------------------
+# MPI-robust per-cell tangent construction (DG0 vector)
+# -----------------------------------------------------------------------------
+
+def cell_tangent_dg_safe(mesh: Mesh) -> Function:
+    """Return DG0 vector Function with per-cell unit tangents.
+
+    Computes tangents from cell vertex coordinates on each owned cell and
+    writes values via the vector dofmap, finalizing with apply("insert").
+    Avoids global indexing assumptions so it is safe under MPI partitioning.
+    """
+    Vdg = VectorFunctionSpace(mesh, "DG", 0)
+    v = Function(Vdg)
+    dofmap = Vdg.dofmap()
+    r0, r1 = dofmap.ownership_range()
+    # local vector slice size
+    local = np.zeros(r1 - r0, dtype=float)
+    gdim = mesh.geometry().dim()
+    # iterate only local cells
+    for cell in cells(mesh):
+        g_dofs = dofmap.cell_dofs(cell.index())
+        coords = cell.get_vertex_coordinates()
+        # handle 1D (interval embedded in gdim) and general case by using first two vertices
+        p0 = np.array(coords[0:gdim], dtype=float)
+        p1 = np.array(coords[gdim:2 * gdim], dtype=float)
+        d = p1 - p0
+        n = np.linalg.norm(d)
+        t = d / n if n > 1e-12 else np.zeros(gdim, dtype=float)
+        # write per-component into local vector slice
+        for i in range(min(len(t), len(g_dofs))):
+            gd = g_dofs[i]
+            if r0 <= gd < r1:
+                local[gd - r0] = t[i]
+    v.vector().set_local(local)
+    v.vector().apply("insert")
+    return v
+
+
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     print("auxiliaryFunctions_dolfin (legacy) imported OK")
